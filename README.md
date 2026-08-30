@@ -11,6 +11,7 @@ Possible Y values for each X/Z position are packed into a `u64`.
 The fast path generates 64-Y rotation signatures only on sparse Z rows, then applies observations with bitwise ANDs instead of checking every Y separately.
 
 Source signatures are generated using a finite-difference recurrence, and mirrored `(x, z)` signatures are reused when possible.
+Sparse source rows that overlap adjacent 64-Z bands are cached instead of generated twice.
 
 The current sparse cover uses:
 

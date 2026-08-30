@@ -212,7 +212,7 @@ fn flush_grid_batch(grid ptr[Grid], seeds vec[8,u64], coordinates_z vec[8,usize]
     }
 }
 
-fn generate_grid(grid ptr[Grid], x_min i64, x_max i64, z_min i64, z_max i64, z_residue i64, reflected bool, p_direct ptr[u64], p_reflected ptr[u64], p_x_min i64, stats ptr[ScanStats]) void {
+fn generate_grid(grid ptr[Grid], x_min i64, x_max i64, z_min i64, z_max i64, z_residue i64, reflected bool, p_direct ptr[u64], p_reflected ptr[u64], p_x_min i64, stats ptr[ScanStats], cache ptr[u64], cache_stride usize, cached_z ptr[i64], cache_valid ptr[bool]) void {
     grid[0].x_first = x_min
     grid[0].z_first = first_congruent(z_min, z_residue, 32)
     grid[0].x_count = bitcast[usize](x_max - x_min)
@@ -221,34 +221,45 @@ fn generate_grid(grid ptr[Grid], x_min i64, x_max i64, z_min i64, z_max i64, z_r
     } else {
         grid[0].z_count = bitcast[usize]((z_max - 1 - grid[0].z_first) / 32 + 1)
     }
+    reuse bool = false
+    reused_row usize = 0
+    if cache_valid[0] && cached_z[0] >= grid[0].z_first && cached_z[0] < z_max {
+        distance i64 = cached_z[0] - grid[0].z_first
+        if distance % 32 == 0 {
+            reuse = true
+            reused_row = bitcast[usize](distance / 32)
+        }
+    }
     for desired_base_low u64 = 0; desired_base_low < 64; desired_base_low += 1 {
         seeds vec[8,u64] = splat(0)
         coordinates_z vec[8,usize] = splat(0)
         coordinates_x vec[8,usize] = splat(0)
         lanes usize = 0
         for zi usize = 0; zi < grid[0].z_count; zi += 1 {
-            rz i64 = grid[0].z_first + bitcast[i64](zi * 32)
-            physical_z i32 = trunc[i32](reflected ? -rz : rz)
-            q u64 = q_bits(physical_z)
-            physical_x_residue u64 = (47 * (desired_base_low ^ (q & 63))) & 63
-            canonical_x_residue i64 = bitcast[i64](physical_x_residue)
-            if reflected { canonical_x_residue = bitcast[i64]((64 - physical_x_residue) & 63) }
-            xi usize = bitcast[usize](floor_mod(canonical_x_residue - floor_mod(grid[0].x_first, 64), 64))
-            while xi < grid[0].x_count {
-                if lanes == 8 {
-                    flush_grid_batch(grid, seeds, coordinates_z, coordinates_x, lanes, desired_base_low)
-                    seeds = splat(0)
-                    lanes = 0
+            if !reuse || zi != reused_row {
+                rz i64 = grid[0].z_first + bitcast[i64](zi * 32)
+                physical_z i32 = trunc[i32](reflected ? -rz : rz)
+                q u64 = q_bits(physical_z)
+                physical_x_residue u64 = (47 * (desired_base_low ^ (q & 63))) & 63
+                canonical_x_residue i64 = bitcast[i64](physical_x_residue)
+                if reflected { canonical_x_residue = bitcast[i64]((64 - physical_x_residue) & 63) }
+                xi usize = bitcast[usize](floor_mod(canonical_x_residue - floor_mod(grid[0].x_first, 64), 64))
+                while xi < grid[0].x_count {
+                    if lanes == 8 {
+                        flush_grid_batch(grid, seeds, coordinates_z, coordinates_x, lanes, desired_base_low)
+                        seeds = splat(0)
+                        lanes = 0
+                    }
+                    rx i64 = grid[0].x_first + bitcast[i64](xi)
+                    p_index usize = bitcast[usize](rx - p_x_min)
+                    p u64 = reflected ? p_reflected[p_index] : p_direct[p_index]
+                    base u64 = p ^ q
+                    coordinates_z[lanes] = zi
+                    coordinates_x[lanes] = xi
+                    seeds[lanes] = (base ^ 18446744073709551615) & 18446744073709551552
+                    lanes += 1
+                    xi += 64
                 }
-                rx i64 = grid[0].x_first + bitcast[i64](xi)
-                p_index usize = bitcast[usize](rx - p_x_min)
-                p u64 = reflected ? p_reflected[p_index] : p_direct[p_index]
-                base u64 = p ^ q
-                coordinates_z[lanes] = zi
-                coordinates_x[lanes] = xi
-                seeds[lanes] = (base ^ 18446744073709551615) & 18446744073709551552
-                lanes += 1
-                xi += 64
             }
         }
         if lanes != 0 { flush_grid_batch(grid, seeds, coordinates_z, coordinates_x, lanes, desired_base_low) }
@@ -258,13 +269,42 @@ fn generate_grid(grid ptr[Grid], x_min i64, x_max i64, z_min i64, z_max i64, z_r
         physical_z i32 = trunc[i32](reflected ? -rz : rz)
         q u64 = q_bits(physical_z)
         row usize = zi * grid[0].x_count
-        for xi usize = 0; xi < grid[0].x_count; xi += 1 {
-            rx i64 = grid[0].x_first + bitcast[i64](xi)
-            physical_x i32 = trunc[i32](reflected ? -rx : rx)
-            p_index usize = bitcast[usize](rx - p_x_min)
-            p u64 = reflected ? p_reflected[p_index] : p_direct[p_index]
-            base u64 = p ^ q
-            store_masks(grid, row + xi, physical_x, physical_z, base, q, grid[0].bits_zero[row + xi], grid[0].bits_one[row + xi], stats)
+        if reuse && zi == reused_row {
+            for xi usize = 0; xi < grid[0].x_count; xi += 1 {
+                grid[0].zero[row + xi] = cache[xi]
+                grid[0].one[row + xi] = cache[cache_stride + xi]
+                grid[0].three[row + xi] = cache[2 * cache_stride + xi]
+                grid[0].mirror_zero[row + xi] = cache[3 * cache_stride + xi]
+                grid[0].mirror_one[row + xi] = cache[4 * cache_stride + xi]
+                grid[0].mirror_three[row + xi] = cache[5 * cache_stride + xi]
+            }
+        } else {
+            for xi usize = 0; xi < grid[0].x_count; xi += 1 {
+                rx i64 = grid[0].x_first + bitcast[i64](xi)
+                physical_x i32 = trunc[i32](reflected ? -rx : rx)
+                p_index usize = bitcast[usize](rx - p_x_min)
+                p u64 = reflected ? p_reflected[p_index] : p_direct[p_index]
+                base u64 = p ^ q
+                store_masks(grid, row + xi, physical_x, physical_z, base, q, grid[0].bits_zero[row + xi], grid[0].bits_one[row + xi], stats)
+            }
+        }
+    }
+    if grid[0].z_count == 0 {
+        cache_valid[0] = false
+    } else {
+        last_row usize = grid[0].z_count - 1
+        cached_z[0] = grid[0].z_first + bitcast[i64](last_row * 32)
+        cache_valid[0] = cached_z[0] >= z_min + 64
+        row usize = last_row * grid[0].x_count
+        if cache_valid[0] {
+            for xi usize = 0; xi < grid[0].x_count; xi += 1 {
+                cache[xi] = grid[0].zero[row + xi]
+                cache[cache_stride + xi] = grid[0].one[row + xi]
+                cache[2 * cache_stride + xi] = grid[0].three[row + xi]
+                cache[3 * cache_stride + xi] = grid[0].mirror_zero[row + xi]
+                cache[4 * cache_stride + xi] = grid[0].mirror_one[row + xi]
+                cache[5 * cache_stride + xi] = grid[0].mirror_three[row + xi]
+            }
         }
     }
 }
@@ -479,6 +519,9 @@ extern "C" {
         p_reflected ptr[u64] = allocate[u64](source_x_capacity)
         if p_reflected == null { return 1 }
         defer { release[u64](p_reflected) }
+        cache_storage ptr[u64] = allocate[u64](36 * source_x_capacity)
+        if cache_storage == null { return 1 }
+        defer { release[u64](cache_storage) }
         live_direct ptr[u64] = allocate[u64](live_capacity)
         if live_direct == null { return 1 }
         defer { release[u64](live_direct) }
@@ -505,6 +548,12 @@ extern "C" {
                     source_coordinate i32 = trunc[i32](source_x_min + bitcast[i64](source_index))
                     p_direct[source_index] = p_bits(source_coordinate)
                     p_reflected[source_index] = p_bits(-source_coordinate)
+                }
+                cache_z arr[6,i64]
+                cache_valid arr[6,bool]
+                for cache_index usize = 0; cache_index < 6; cache_index += 1 {
+                    cache_z[cache_index] = 0
+                    cache_valid[cache_index] = false
                 }
                 for band_z0 i64 = z0; band_z0 < z1; band_z0 += 64 {
                     band_z1 i64 = minimum[i64](z1, band_z0 + 64)
@@ -535,7 +584,9 @@ extern "C" {
                         for side usize = 0; side < 2; side += 1 {
                             source_residue i64 = side == 0 ? representative : negative_representative
                             reflected bool = side != 0
-                            generate_grid(&grid, source_x_min, source_x_max, band_source_z_min, band_source_z_max, source_residue, reflected, p_direct, p_reflected, source_x_min, stats)
+                            cached_slot usize = family * 2 + side
+                            cache ptr[u64] = &cache_storage[cached_slot * 6 * source_x_capacity]
+                            generate_grid(&grid, source_x_min, source_x_max, band_source_z_min, band_source_z_max, source_residue, reflected, p_direct, p_reflected, source_x_min, stats, cache, source_x_capacity, &cache_z[cached_slot], &cache_valid[cached_slot])
                             for constraint_row usize = 0; constraint_row < band_rows; constraint_row += 1 {
                                 constraint_z i64 = band_z0 + bitcast[i64](constraint_row)
                                 constraint_direct_begin usize = 0
