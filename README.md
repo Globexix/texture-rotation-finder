@@ -23,9 +23,12 @@ Candidates that survive the mask pass are verified with the exact rotation funct
 ## Benchmark
 
 Search area:
+
+```text
 x: -225000 .. 225000
 y: -60 .. 0
 z: -225000 .. 225000
+```
 
 AMD Ryzen 9 9950X, 32 threads, `-O3 -march=native`.
 
@@ -33,8 +36,6 @@ AMD Ryzen 9 9950X, 32 threads, `-O3 -march=native`.
 | ------- | --------: |
 | 32      |  78.96 s |
 | 1       |22m 37s|
-
-Sin
 
 Measured with Hyperfine, 1 warmup and 3 runs.
 
