@@ -455,14 +455,13 @@ extern "C" {
         return 0
     }
 
-    fn fas_scan_worker(observations ptr[const Observation], observation_count usize, range ptr[const SearchRange], tile_size i64, tile_begin i64, tile_end i64, context ptr[u8], stats ptr[ScanStats]) i32 {
+    fn fas_scan_worker(observations ptr[const Observation], observation_count usize, range ptr[const SearchRange], tile_size i64, z_begin i64, z_end i64, context ptr[u8], stats ptr[ScanStats]) i32 {
         initial_live u64 = 0
         for y i32 = range[0].y_min; y < range[0].y_max; y += 1 {
             initial_live |= shl(zext[u64](1), zext[u64](y + 60))
         }
         x_union_min i64 = minimum[i64](sext[i64](range[0].x_min), -sext[i64](range[0].x_max - 1))
         x_union_max i64 = maximum[i64](sext[i64](range[0].x_max - 1), -sext[i64](range[0].x_min))
-        canonical_z_max i64 = maximum[i64](0, maximum[i64](sext[i64](range[0].z_max - 1), -sext[i64](range[0].z_min)))
         x_halo i64 = 0
         z_halo i64 = 0
         for halo_index usize = 0; halo_index < observation_count; halo_index += 1 {
@@ -495,9 +494,8 @@ extern "C" {
         grid Grid = (Grid){0, 0, 0, 0, null, null, null, null, null, null, null, null}
         defer { grid_release(&grid) }
         if !grid_allocate(&grid, grid_capacity) { return 1 }
-        for tile_index i64 = tile_begin; tile_index < tile_end; tile_index += 1 {
-            z0 i64 = tile_index * tile_size
-            z1 i64 = minimum[i64](canonical_z_max + 1, z0 + tile_size)
+        for z0 i64 = z_begin; z0 < z_end; z0 += tile_size {
+            z1 i64 = minimum[i64](z_end, z0 + tile_size)
             for x0 i64 = x_union_min; x0 <= x_union_max; x0 += tile_size {
                 x1 i64 = minimum[i64](x_union_max + 1, x0 + tile_size)
                 source_x_min i64 = x0 - x_halo

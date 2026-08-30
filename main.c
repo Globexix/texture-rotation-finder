@@ -61,8 +61,8 @@ typedef struct {
     size_t observation_count;
     const SearchRange *range;
     int64_t tile_size;
-    int64_t tile_begin;
-    int64_t tile_end;
+    int64_t work_begin;
+    int64_t work_end;
     bool fast_path;
     ScanStats stats;
     MatchList matches;
@@ -77,7 +77,7 @@ _Static_assert(sizeof(ScanStats) == 40, "ScanStats ABI");
 uint8_t fas_vanilla3_rotation(int32_t x, int32_t y, int32_t z);
 int32_t fas_scan_worker(const Observation *observations, size_t observation_count,
                         const SearchRange *range, int64_t tile_size,
-                        int64_t tile_begin, int64_t tile_end, uint8_t *context,
+                        int64_t z_begin, int64_t z_end, uint8_t *context,
                         ScanStats *stats);
 int32_t fas_scan_general_worker(const Observation *observations,
                                 size_t observation_count,
@@ -342,12 +342,12 @@ static void *run_worker(void *argument) {
     if (worker->fast_path) {
         worker->status = fas_scan_worker(
             worker->observations, worker->observation_count, worker->range,
-            worker->tile_size, worker->tile_begin, worker->tile_end,
+            worker->tile_size, worker->work_begin, worker->work_end,
             (uint8_t *)worker, &worker->stats);
     } else {
         worker->status = fas_scan_general_worker(
             worker->observations, worker->observation_count, worker->range,
-            worker->tile_begin, worker->tile_end, (uint8_t *)worker,
+            worker->work_begin, worker->work_end, (uint8_t *)worker,
             &worker->stats);
     }
     return NULL;
@@ -386,9 +386,10 @@ int main(int argc, char **argv) {
     int64_t negative_z = -(int64_t)options.range.z_min;
     if (positive_z > canonical_z_max) canonical_z_max = positive_z;
     if (negative_z > canonical_z_max) canonical_z_max = negative_z;
-    int64_t tile_count = (canonical_z_max + 1 + options.tile_size - 1) /
-                         options.tile_size;
-    int64_t work_count = fast_path ? tile_count :
+    const int64_t band_size = 64;
+    int64_t canonical_z_count = canonical_z_max + 1;
+    int64_t band_count = (canonical_z_count + band_size - 1) / band_size;
+    int64_t work_count = fast_path ? band_count :
                          (int64_t)options.range.x_max - options.range.x_min;
     int worker_count = options.threads;
     if ((int64_t)worker_count > work_count) worker_count = (int)work_count;
@@ -407,12 +408,17 @@ int main(int argc, char **argv) {
         workers[index].tile_size = options.tile_size;
         workers[index].fast_path = fast_path;
         if (fast_path) {
-            workers[index].tile_begin = tile_count * index / worker_count;
-            workers[index].tile_end = tile_count * (index + 1) / worker_count;
+            int64_t band_begin = band_count * index / worker_count;
+            int64_t band_end = band_count * (index + 1) / worker_count;
+            workers[index].work_begin = band_begin * band_size;
+            workers[index].work_end = band_end * band_size;
+            if (workers[index].work_end > canonical_z_count) {
+                workers[index].work_end = canonical_z_count;
+            }
         } else {
-            workers[index].tile_begin = (int64_t)options.range.x_min +
+            workers[index].work_begin = (int64_t)options.range.x_min +
                 work_count * index / worker_count;
-            workers[index].tile_end = (int64_t)options.range.x_min +
+            workers[index].work_end = (int64_t)options.range.x_min +
                 work_count * (index + 1) / worker_count;
         }
     }
@@ -423,7 +429,7 @@ int main(int argc, char **argv) {
         run_worker(&workers[0]);
     } else {
         int created = 0;
-        for (; created < worker_count; ++created) {
+        for (; created < worker_count - 1; ++created) {
             int error = pthread_create(&threads[created], NULL, run_worker,
                                        &workers[created]);
             if (error != 0) {
@@ -431,8 +437,11 @@ int main(int argc, char **argv) {
                 break;
             }
         }
-        for (int index = 0; index < created; ++index) pthread_join(threads[index], NULL);
-        if (created != worker_count) return 1;
+        if (created == worker_count - 1) run_worker(&workers[worker_count - 1]);
+        for (int index = 0; index < created; ++index) {
+            pthread_join(threads[index], NULL);
+        }
+        if (created != worker_count - 1) return 1;
     }
     clock_gettime(CLOCK_MONOTONIC, &finished);
 
@@ -487,6 +496,7 @@ int main(int argc, char **argv) {
                   (double)candidate_positions / elapsed / 1000000.0;
     fprintf(stderr,
             "threads=%d\n"
+            "threads_requested=%d\n"
             "elapsed_seconds=%.3f\n"
             "candidate_columns=%" PRIu64 "\n"
             "candidate_positions=%" PRIu64 "\n"
@@ -496,12 +506,15 @@ int main(int argc, char **argv) {
             "verifier_evaluations=%" PRIu64 "\n"
             "matches=%" PRIu64 "\n"
             "million_positions_per_second=%.3f\n",
-            options.threads, elapsed, candidate_columns, candidate_positions,
+            worker_count, options.threads, elapsed, candidate_columns,
+            candidate_positions,
             stats.paid_source_columns, stats.generated_source_blocks,
             stats.prefix_survivors, stats.verifier_evaluations, stats.matches,
             rate);
 
-    for (int index = 0; index < worker_count; ++index) free(workers[index].matches.data);
+    for (int index = 0; index < worker_count; ++index) {
+        free(workers[index].matches.data);
+    }
     free(matches.data);
     free(threads);
     free(workers);
