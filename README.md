@@ -31,10 +31,13 @@ z: -225000 .. 225000
 
 AMD Ryzen 9 9950X, 32 threads, `-O3 -march=native`.
 
+The 16 thread runs use one hardware thread per physical core.
+
 | Threads |      Mean |
 | ------- | --------: |
-| 32      |  78.96 s |
-| 1       |22m 37s|
+| 32      |  47.1 s|
+| 16      |  46.2 s |
+| 1       |9m 44s|
 
 Measured with Hyperfine, 1 warmup and 3 runs.
 
