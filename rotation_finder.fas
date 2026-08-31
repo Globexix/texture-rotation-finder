@@ -364,16 +364,59 @@ fn apply_masks(live ptr[u64], count usize, grid ptr[Grid], source_x0 i64, source
     if observation[0].rotation != 2 {
         stored usize = observation[0].rotation < 2 ? zext[usize](observation[0].rotation) : 2
         masks ptr[u64] = grid_plane(grid, side_base + stored)
-        for index usize = 0; index < count; index += 1 {
-            live[index] &= lshr(masks[source + index], shift)
+        if shift == 0 {
+            for zero_shift_index usize = 0; zero_shift_index < count; zero_shift_index += 1 {
+                live[zero_shift_index] &= masks[source + zero_shift_index]
+            }
+        } else {
+            for general_shift_index usize = 0; general_shift_index < count; general_shift_index += 1 {
+                live[general_shift_index] &= lshr(masks[source + general_shift_index], shift)
+            }
         }
     } else {
         zero ptr[u64] = grid_plane(grid, side_base)
         one ptr[u64] = grid_plane(grid, side_base + 1)
         three ptr[u64] = grid_plane(grid, side_base + 2)
-        for index usize = 0; index < count; index += 1 {
-            mask u64 = 0x3fffffffffffffff & ~(zero[source + index] | one[source + index] | three[source + index])
-            live[index] &= lshr(mask, shift)
+        if shift == 0 {
+            for zero_shift_index usize = 0; zero_shift_index < count; zero_shift_index += 1 {
+                mask u64 = 0x3fffffffffffffff & ~(zero[source + zero_shift_index] | one[source + zero_shift_index] | three[source + zero_shift_index])
+                live[zero_shift_index] &= mask
+            }
+        } else {
+            for general_shift_index usize = 0; general_shift_index < count; general_shift_index += 1 {
+                mask u64 = 0x3fffffffffffffff & ~(zero[source + general_shift_index] | one[source + general_shift_index] | three[source + general_shift_index])
+                live[general_shift_index] &= lshr(mask, shift)
+            }
+        }
+    }
+}
+
+fn apply_mask_pair(live ptr[u64], count usize, grid ptr[Grid], first_source_x0 i64, first_source_z i64, second_source_x0 i64, second_source_z i64, z_stride i64, first_observation ptr[const Observation], second_observation ptr[const Observation], mirror_mask bool) void {
+    first_source_x usize = bitcast[usize](first_source_x0 - grid[0].x_first)
+    first_source_row usize = bitcast[usize]((first_source_z - grid[0].z_first) / z_stride)
+    first_source usize = first_source_row * grid[0].x_count + first_source_x
+    second_source_x usize = bitcast[usize](second_source_x0 - grid[0].x_first)
+    second_source_row usize = bitcast[usize]((second_source_z - grid[0].z_first) / z_stride)
+    second_source usize = second_source_row * grid[0].x_count + second_source_x
+    side_base usize = mirror_mask ? 3 : 0
+    first_stored usize = first_observation[0].rotation < 2 ? zext[usize](first_observation[0].rotation) : 2
+    second_stored usize = second_observation[0].rotation < 2 ? zext[usize](second_observation[0].rotation) : 2
+    first_masks ptr[u64] = grid_plane(grid, side_base + first_stored)
+    second_masks ptr[u64] = grid_plane(grid, side_base + second_stored)
+    shift u64 = zext[u64](first_observation[0].dy)
+    if shift == 0 {
+        for zero_shift_index usize = 0; zero_shift_index < count; zero_shift_index += 1 {
+            live[zero_shift_index] &= first_masks[first_source + zero_shift_index] & second_masks[second_source + zero_shift_index]
+        }
+    } else if shift == 1 {
+        for one_shift_index usize = 0; one_shift_index < count; one_shift_index += 1 {
+            combined u64 = first_masks[first_source + one_shift_index] & second_masks[second_source + one_shift_index]
+            live[one_shift_index] &= lshr(combined, 1)
+        }
+    } else {
+        for general_shift_index usize = 0; general_shift_index < count; general_shift_index += 1 {
+            combined u64 = first_masks[first_source + general_shift_index] & second_masks[second_source + general_shift_index]
+            live[general_shift_index] &= lshr(combined, shift)
         }
     }
 }
@@ -568,6 +611,24 @@ extern "C" {
                 dense_observation_indices[dense_sort_position] = dense_sort_index
                 residue_counts[dense_sort_residue] += 1
             }
+            for dense_group_slot usize = 0; dense_group_slot < bitcast[usize](dense_stride); dense_group_slot += 1 {
+                dense_group_begin usize = dense_bucket_offsets[dense_group_slot]
+                dense_group_end usize = dense_bucket_offsets[dense_group_slot + 1]
+                for dense_group_position usize = dense_group_begin + 1; dense_group_position < dense_group_end; dense_group_position += 1 {
+                    dense_group_index usize = dense_observation_indices[dense_group_position]
+                    dense_group_observation ptr[const Observation] = &observations[dense_group_index]
+                    dense_group_insert usize = dense_group_position
+                    while dense_group_insert > dense_group_begin {
+                        dense_group_previous_index usize = dense_observation_indices[dense_group_insert - 1]
+                        dense_group_previous ptr[const Observation] = &observations[dense_group_previous_index]
+                        dense_group_move bool = dense_group_previous[0].dy > dense_group_observation[0].dy || (dense_group_previous[0].dy == dense_group_observation[0].dy && dense_group_previous[0].rotation == 2 && dense_group_observation[0].rotation != 2)
+                        if !dense_group_move { break }
+                        dense_observation_indices[dense_group_insert] = dense_group_previous_index
+                        dense_group_insert -= 1
+                    }
+                    dense_observation_indices[dense_group_insert] = dense_group_index
+                }
+            }
         }
         source_x_capacity usize = bitcast[usize](tile_size + 2 * x_halo)
         source_z_capacity usize = dense_stride != 0 ? bitcast[usize]((64 + 2 * z_halo + dense_stride - 1) / dense_stride + 1) : bitcast[usize]((64 + 2 * z_halo + 31) / 32 + 1)
@@ -671,18 +732,44 @@ extern "C" {
                             if dense_direct_bucket < 0 { dense_direct_bucket += dense_stride }
                             if dense_direct_count != 0 {
                                 dense_direct_bucket_index usize = bitcast[usize](dense_direct_bucket)
-                                for dense_direct_position usize = dense_bucket_offsets[dense_direct_bucket_index]; dense_direct_position < dense_bucket_offsets[dense_direct_bucket_index + 1]; dense_direct_position += 1 {
+                                dense_direct_position usize = dense_bucket_offsets[dense_direct_bucket_index]
+                                while dense_direct_position < dense_bucket_offsets[dense_direct_bucket_index + 1] {
                                     dense_observation ptr[const Observation] = &observations[dense_observation_indices[dense_direct_position]]
-                                    apply_masks(&live_direct[dense_constraint_row * band_x_count + dense_direct_begin], dense_direct_count, &grid, x0 + bitcast[i64](dense_direct_begin) + sext[i64](dense_observation[0].dx), dense_constraint_z + sext[i64](dense_observation[0].dz), dense_stride, dense_observation, false)
+                                    if dense_direct_position + 1 < dense_bucket_offsets[dense_direct_bucket_index + 1] {
+                                        next_dense_observation ptr[const Observation] = &observations[dense_observation_indices[dense_direct_position + 1]]
+                                        if dense_observation[0].rotation != 2 && next_dense_observation[0].rotation != 2 && dense_observation[0].dy == next_dense_observation[0].dy {
+                                            apply_mask_pair(&live_direct[dense_constraint_row * band_x_count + dense_direct_begin], dense_direct_count, &grid, x0 + bitcast[i64](dense_direct_begin) + sext[i64](dense_observation[0].dx), dense_constraint_z + sext[i64](dense_observation[0].dz), x0 + bitcast[i64](dense_direct_begin) + sext[i64](next_dense_observation[0].dx), dense_constraint_z + sext[i64](next_dense_observation[0].dz), dense_stride, dense_observation, next_dense_observation, false)
+                                            dense_direct_position += 2
+                                        } else {
+                                            apply_masks(&live_direct[dense_constraint_row * band_x_count + dense_direct_begin], dense_direct_count, &grid, x0 + bitcast[i64](dense_direct_begin) + sext[i64](dense_observation[0].dx), dense_constraint_z + sext[i64](dense_observation[0].dz), dense_stride, dense_observation, false)
+                                            dense_direct_position += 1
+                                        }
+                                    } else {
+                                        apply_masks(&live_direct[dense_constraint_row * band_x_count + dense_direct_begin], dense_direct_count, &grid, x0 + bitcast[i64](dense_direct_begin) + sext[i64](dense_observation[0].dx), dense_constraint_z + sext[i64](dense_observation[0].dz), dense_stride, dense_observation, false)
+                                        dense_direct_position += 1
+                                    }
                                 }
                             }
                             dense_mirror_bucket i64 = dense_constraint_mod - selected_dense_residue
                             if dense_mirror_bucket < 0 { dense_mirror_bucket += dense_stride }
                             if dense_mirror_count != 0 {
                                 dense_mirror_bucket_index usize = bitcast[usize](dense_mirror_bucket)
-                                for dense_mirror_position usize = dense_bucket_offsets[dense_mirror_bucket_index]; dense_mirror_position < dense_bucket_offsets[dense_mirror_bucket_index + 1]; dense_mirror_position += 1 {
+                                dense_mirror_position usize = dense_bucket_offsets[dense_mirror_bucket_index]
+                                while dense_mirror_position < dense_bucket_offsets[dense_mirror_bucket_index + 1] {
                                     dense_mirror_observation ptr[const Observation] = &observations[dense_observation_indices[dense_mirror_position]]
-                                    apply_masks(&live_mirror[dense_constraint_row * band_x_count + dense_mirror_begin], dense_mirror_count, &grid, x0 + bitcast[i64](dense_mirror_begin) - sext[i64](dense_mirror_observation[0].dx), dense_constraint_z - sext[i64](dense_mirror_observation[0].dz), dense_stride, dense_mirror_observation, true)
+                                    if dense_mirror_position + 1 < dense_bucket_offsets[dense_mirror_bucket_index + 1] {
+                                        next_dense_mirror_observation ptr[const Observation] = &observations[dense_observation_indices[dense_mirror_position + 1]]
+                                        if dense_mirror_observation[0].rotation != 2 && next_dense_mirror_observation[0].rotation != 2 && dense_mirror_observation[0].dy == next_dense_mirror_observation[0].dy {
+                                            apply_mask_pair(&live_mirror[dense_constraint_row * band_x_count + dense_mirror_begin], dense_mirror_count, &grid, x0 + bitcast[i64](dense_mirror_begin) - sext[i64](dense_mirror_observation[0].dx), dense_constraint_z - sext[i64](dense_mirror_observation[0].dz), x0 + bitcast[i64](dense_mirror_begin) - sext[i64](next_dense_mirror_observation[0].dx), dense_constraint_z - sext[i64](next_dense_mirror_observation[0].dz), dense_stride, dense_mirror_observation, next_dense_mirror_observation, true)
+                                            dense_mirror_position += 2
+                                        } else {
+                                            apply_masks(&live_mirror[dense_constraint_row * band_x_count + dense_mirror_begin], dense_mirror_count, &grid, x0 + bitcast[i64](dense_mirror_begin) - sext[i64](dense_mirror_observation[0].dx), dense_constraint_z - sext[i64](dense_mirror_observation[0].dz), dense_stride, dense_mirror_observation, true)
+                                            dense_mirror_position += 1
+                                        }
+                                    } else {
+                                        apply_masks(&live_mirror[dense_constraint_row * band_x_count + dense_mirror_begin], dense_mirror_count, &grid, x0 + bitcast[i64](dense_mirror_begin) - sext[i64](dense_mirror_observation[0].dx), dense_constraint_z - sext[i64](dense_mirror_observation[0].dz), dense_stride, dense_mirror_observation, true)
+                                        dense_mirror_position += 1
+                                    }
                                 }
                             }
                             dense_constraint_mod += 1
