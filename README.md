@@ -10,8 +10,8 @@ Possible Y values for each X/Z position are packed into a `u64`.
 
 The fast path generates 64-Y rotation signatures only on sparse Z rows, then applies observations with bitwise ANDs instead of checking every Y separately.
 
-Source signatures are generated using a finite-difference recurrence, and mirrored `(x, z)` signatures are reused when possible.
-Sparse source rows that overlap adjacent 64-Z bands are cached instead of generated twice. The scanner automatically selects the largest single-pass Z modulus for which every `dz` residue class supplies at least five observations. Patterns that do not support a suitable single-pass cover retain the general sparse cover:
+Source signatures are generated in contiguous vector batches using a finite-difference recurrence, and mirrored `(x, z)` signatures are reused when possible.
+Sparse source rows that overlap adjacent 64-Z bands are cached instead of generated twice; the cache adapts to the pattern's Z halo. The scanner automatically selects the largest single-pass Z modulus for which every `dz` residue class supplies at least four observations, then buckets the observations by residue. Patterns that do not support a suitable single-pass cover retain the general sparse cover:
 
 ```text
 z mod 32 = ±2, ±8, ±13

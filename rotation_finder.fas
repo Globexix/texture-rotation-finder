@@ -192,9 +192,10 @@ fn store_masks(grid ptr[Grid], index usize, x i32, z i32, base u64, q u64, plane
     }
 }
 
-fn flush_grid_batch(grid ptr[Grid], seeds vec[8,u64], coordinates_z vec[8,usize], coordinates_x vec[8,usize], lanes usize, desired_base_low u64) void {
-    values vec[8,u64] = seeds * (seeds * splat(42317861) + splat(11))
-    differences vec[8,u64] = splat(42317861) * (seeds * splat(2) + splat(1)) + splat(11)
+fn flush_grid_batch(grid ptr[Grid], seeds ptr[u64], coordinates_z ptr[usize], coordinates_x ptr[usize], lanes usize, desired_base_low u64) void {
+    seed_vector vec[8,u64] = bitcast[ptr[vec[8,u64]]](seeds)[0]
+    values vec[8,u64] = seed_vector * (seed_vector * splat(42317861) + splat(11))
+    differences vec[8,u64] = splat(42317861) * (seed_vector * splat(2) + splat(1)) + splat(11)
     plane_zero vec[8,u64] = splat(0)
     plane_one vec[8,u64] = splat(0)
     for low u64 = 0; low < 64; low += 1 {
@@ -212,7 +213,7 @@ fn flush_grid_batch(grid ptr[Grid], seeds vec[8,u64], coordinates_z vec[8,usize]
     }
 }
 
-fn generate_grid(grid ptr[Grid], x_min i64, x_max i64, z_min i64, z_max i64, z_residue i64, z_stride i64, reflected bool, p_direct ptr[u64], p_reflected ptr[u64], p_x_min i64, stats ptr[ScanStats], cache ptr[u64], cache_stride usize, cached_z ptr[i64], cache_count ptr[usize], cache_capacity usize) void {
+fn generate_grid(grid ptr[Grid], x_min i64, x_max i64, z_min i64, z_max i64, z_residue i64, z_stride i64, reflected bool, p_direct ptr[u64], p_reflected ptr[u64], p_x_min i64, stats ptr[ScanStats], cache ptr[u64], cache_stride usize, cached_z ptr[i64], cache_count ptr[usize], cache_capacity usize, reused_indices ptr[usize], reused_valid ptr[bool]) void {
     grid[0].x_first = x_min
     grid[0].z_first = first_congruent(z_min, z_residue, z_stride)
     grid[0].x_count = bitcast[usize](x_max - x_min)
@@ -221,28 +222,27 @@ fn generate_grid(grid ptr[Grid], x_min i64, x_max i64, z_min i64, z_max i64, z_r
     } else {
         grid[0].z_count = bitcast[usize]((z_max - 1 - grid[0].z_first) / z_stride + 1)
     }
-    reused_rows arr[2,usize]
-    reused_valid arr[2,bool]
-    reused_rows[0] = 0
-    reused_rows[1] = 0
-    reused_valid[0] = false
-    reused_valid[1] = false
+    for reused_row usize = 0; reused_row < grid[0].z_count; reused_row += 1 {
+        reused_indices[reused_row] = 0
+        reused_valid[reused_row] = false
+    }
     for cache_index usize = 0; cache_index < cache_capacity; cache_index += 1 {
         if cache_index < cache_count[0] && cached_z[cache_index] >= grid[0].z_first && cached_z[cache_index] < z_max {
             distance i64 = cached_z[cache_index] - grid[0].z_first
             if distance % z_stride == 0 {
-                reused_valid[cache_index] = true
-                reused_rows[cache_index] = bitcast[usize](distance / z_stride)
+                calculated_reused_row usize = bitcast[usize](distance / z_stride)
+                reused_valid[calculated_reused_row] = true
+                reused_indices[calculated_reused_row] = cache_index
             }
         }
     }
     for desired_base_low u64 = 0; desired_base_low < 64; desired_base_low += 1 {
-        seeds vec[8,u64] = splat(0)
-        coordinates_z vec[8,usize] = splat(0)
-        coordinates_x vec[8,usize] = splat(0)
+        seeds arr[8,u64]
+        coordinates_z arr[8,usize]
+        coordinates_x arr[8,usize]
         lanes usize = 0
         for zi usize = 0; zi < grid[0].z_count; zi += 1 {
-            if (!reused_valid[0] || zi != reused_rows[0]) && (!reused_valid[1] || zi != reused_rows[1]) {
+            if !reused_valid[zi] {
                 rz i64 = grid[0].z_first + bitcast[i64](zi) * z_stride
                 physical_z i32 = trunc[i32](reflected ? -rz : rz)
                 q u64 = q_bits(physical_z)
@@ -252,8 +252,7 @@ fn generate_grid(grid ptr[Grid], x_min i64, x_max i64, z_min i64, z_max i64, z_r
                 xi usize = bitcast[usize](floor_mod(canonical_x_residue - floor_mod(grid[0].x_first, 64), 64))
                 while xi < grid[0].x_count {
                     if lanes == 8 {
-                        flush_grid_batch(grid, seeds, coordinates_z, coordinates_x, lanes, desired_base_low)
-                        seeds = splat(0)
+                        flush_grid_batch(grid, &seeds[0], &coordinates_z[0], &coordinates_x[0], lanes, desired_base_low)
                         lanes = 0
                     }
                     rx i64 = grid[0].x_first + bitcast[i64](xi)
@@ -268,17 +267,20 @@ fn generate_grid(grid ptr[Grid], x_min i64, x_max i64, z_min i64, z_max i64, z_r
                 }
             }
         }
-        if lanes != 0 { flush_grid_batch(grid, seeds, coordinates_z, coordinates_x, lanes, desired_base_low) }
+        if lanes != 0 {
+            for padding_lane usize = lanes; padding_lane < 8; padding_lane += 1 {
+                seeds[padding_lane] = 0
+            }
+            flush_grid_batch(grid, &seeds[0], &coordinates_z[0], &coordinates_x[0], lanes, desired_base_low)
+        }
     }
     for zi usize = 0; zi < grid[0].z_count; zi += 1 {
         rz i64 = grid[0].z_first + bitcast[i64](zi) * z_stride
         physical_z i32 = trunc[i32](reflected ? -rz : rz)
         q u64 = q_bits(physical_z)
         row usize = zi * grid[0].x_count
-        reused_index usize = 2
-        if reused_valid[0] && zi == reused_rows[0] { reused_index = 0 }
-        if reused_valid[1] && zi == reused_rows[1] { reused_index = 1 }
-        if reused_index < 2 {
+        reused_index usize = reused_valid[zi] ? reused_indices[zi] : cache_capacity
+        if reused_index < cache_capacity {
             cache_base usize = reused_index * 6 * cache_stride
             for xi usize = 0; xi < grid[0].x_count; xi += 1 {
                 grid[0].zero[row + xi] = cache[cache_base + xi]
@@ -529,7 +531,7 @@ extern "C" {
         if residue_counts == null { return 1 }
         defer { release[usize](residue_counts) }
         dense_stride i64 = 0
-        candidate_stride usize = observation_count / 5
+        candidate_stride usize = observation_count / 4
         while candidate_stride >= 2 && dense_stride == 0 {
             for candidate_slot usize = 0; candidate_slot < candidate_stride; candidate_slot += 1 {
                 residue_counts[candidate_slot] = 0
@@ -540,7 +542,7 @@ extern "C" {
             }
             candidate_fits bool = true
             for candidate_check_slot usize = 0; candidate_check_slot < candidate_stride; candidate_check_slot += 1 {
-                if residue_counts[candidate_check_slot] < 5 { candidate_fits = false }
+                if residue_counts[candidate_check_slot] < 4 { candidate_fits = false }
             }
             if candidate_fits {
                 dense_stride = bitcast[i64](candidate_stride)
@@ -548,8 +550,30 @@ extern "C" {
                 candidate_stride -= 1
             }
         }
+        dense_bucket_offsets ptr[usize] = allocate[usize](observation_count + 1)
+        if dense_bucket_offsets == null { return 1 }
+        defer { release[usize](dense_bucket_offsets) }
+        dense_observation_indices ptr[usize] = allocate[usize](observation_count)
+        if dense_observation_indices == null { return 1 }
+        defer { release[usize](dense_observation_indices) }
+        if dense_stride != 0 {
+            dense_bucket_offsets[0] = 0
+            for dense_offset_slot usize = 0; dense_offset_slot < bitcast[usize](dense_stride); dense_offset_slot += 1 {
+                dense_bucket_offsets[dense_offset_slot + 1] = dense_bucket_offsets[dense_offset_slot] + residue_counts[dense_offset_slot]
+                residue_counts[dense_offset_slot] = dense_bucket_offsets[dense_offset_slot]
+            }
+            for dense_sort_index usize = 0; dense_sort_index < observation_count; dense_sort_index += 1 {
+                dense_sort_residue usize = bitcast[usize](floor_mod(sext[i64](observations[dense_sort_index].dz), dense_stride))
+                dense_sort_position usize = residue_counts[dense_sort_residue]
+                dense_observation_indices[dense_sort_position] = dense_sort_index
+                residue_counts[dense_sort_residue] += 1
+            }
+        }
         source_x_capacity usize = bitcast[usize](tile_size + 2 * x_halo)
         source_z_capacity usize = dense_stride != 0 ? bitcast[usize]((64 + 2 * z_halo + dense_stride - 1) / dense_stride + 1) : bitcast[usize]((64 + 2 * z_halo + 31) / 32 + 1)
+        dense_cache_capacity usize = dense_stride != 0 ? bitcast[usize]((2 * z_halo + dense_stride - 1) / dense_stride + 1) : 1
+        sparse_cache_capacity usize = bitcast[usize]((2 * z_halo + 31) / 32 + 1)
+        cache_rows usize = dense_stride != 0 ? dense_cache_capacity : 6 * sparse_cache_capacity
         grid_capacity usize = source_x_capacity * source_z_capacity
         live_capacity usize = bitcast[usize](tile_size * 64)
         candidate_capacity usize = bitcast[usize]((tile_size * 62 + 7) / 8)
@@ -559,9 +583,21 @@ extern "C" {
         p_reflected ptr[u64] = allocate[u64](source_x_capacity)
         if p_reflected == null { return 1 }
         defer { release[u64](p_reflected) }
-        cache_storage ptr[u64] = allocate[u64](36 * source_x_capacity)
+        cache_storage ptr[u64] = allocate[u64](6 * cache_rows * source_x_capacity)
         if cache_storage == null { return 1 }
         defer { release[u64](cache_storage) }
+        dense_cache_z ptr[i64] = allocate[i64](dense_cache_capacity)
+        if dense_cache_z == null { return 1 }
+        defer { release[i64](dense_cache_z) }
+        sparse_cache_z ptr[i64] = allocate[i64](6 * sparse_cache_capacity)
+        if sparse_cache_z == null { return 1 }
+        defer { release[i64](sparse_cache_z) }
+        reused_indices ptr[usize] = allocate[usize](source_z_capacity)
+        if reused_indices == null { return 1 }
+        defer { release[usize](reused_indices) }
+        reused_valid ptr[bool] = allocate[bool](source_z_capacity)
+        if reused_valid == null { return 1 }
+        defer { release[bool](reused_valid) }
         live_direct ptr[u64] = allocate[u64](live_capacity)
         if live_direct == null { return 1 }
         defer { release[u64](live_direct) }
@@ -589,14 +625,9 @@ extern "C" {
                     p_direct[source_index] = p_bits(source_coordinate)
                     p_reflected[source_index] = p_bits(-source_coordinate)
                 }
-                dense_cache_z arr[2,i64]
-                dense_cache_z[0] = 0
-                dense_cache_z[1] = 0
                 dense_cache_count usize = 0
-                sparse_cache_z arr[6,i64]
                 sparse_cache_count arr[6,usize]
                 for cache_index usize = 0; cache_index < 6; cache_index += 1 {
-                    sparse_cache_z[cache_index] = 0
                     sparse_cache_count[cache_index] = 0
                 }
                 for band_z0 i64 = z0; band_z0 < z1; band_z0 += 64 {
@@ -624,7 +655,8 @@ extern "C" {
                     }
                     if dense_stride != 0 {
                         selected_dense_residue i64 = dense_residue(dense_stride)
-                        generate_grid(&grid, source_x_min, source_x_max, band_source_z_min, band_source_z_max, selected_dense_residue, dense_stride, false, p_direct, p_reflected, source_x_min, stats, cache_storage, source_x_capacity, &dense_cache_z[0], &dense_cache_count, 2)
+                        generate_grid(&grid, source_x_min, source_x_max, band_source_z_min, band_source_z_max, selected_dense_residue, dense_stride, false, p_direct, p_reflected, source_x_min, stats, cache_storage, source_x_capacity, dense_cache_z, &dense_cache_count, dense_cache_capacity, reused_indices, reused_valid)
+                        dense_constraint_mod i64 = floor_mod(band_z0, dense_stride)
                         for dense_constraint_row usize = 0; dense_constraint_row < band_rows; dense_constraint_row += 1 {
                             dense_constraint_z i64 = band_z0 + bitcast[i64](dense_constraint_row)
                             dense_direct_begin usize = 0
@@ -635,17 +667,26 @@ extern "C" {
                             dense_mirror_begin usize = 0
                             dense_mirror_count usize = 0
                             mirror_span(range, x0, x1, dense_constraint_z, &dense_mirror_begin, &dense_mirror_count)
-                            for dense_observation_index usize = 0; dense_observation_index < observation_count; dense_observation_index += 1 {
-                                dense_observation ptr[const Observation] = &observations[dense_observation_index]
-                                dense_direct_residue i64 = floor_mod(dense_constraint_z + sext[i64](dense_observation[0].dz), dense_stride)
-                                if dense_direct_count != 0 && dense_direct_residue == selected_dense_residue {
+                            dense_direct_bucket i64 = selected_dense_residue - dense_constraint_mod
+                            if dense_direct_bucket < 0 { dense_direct_bucket += dense_stride }
+                            if dense_direct_count != 0 {
+                                dense_direct_bucket_index usize = bitcast[usize](dense_direct_bucket)
+                                for dense_direct_position usize = dense_bucket_offsets[dense_direct_bucket_index]; dense_direct_position < dense_bucket_offsets[dense_direct_bucket_index + 1]; dense_direct_position += 1 {
+                                    dense_observation ptr[const Observation] = &observations[dense_observation_indices[dense_direct_position]]
                                     apply_masks(&live_direct[dense_constraint_row * band_x_count + dense_direct_begin], dense_direct_count, &grid, x0 + bitcast[i64](dense_direct_begin) + sext[i64](dense_observation[0].dx), dense_constraint_z + sext[i64](dense_observation[0].dz), dense_stride, dense_observation, false)
                                 }
-                                dense_mirror_residue i64 = floor_mod(dense_constraint_z - sext[i64](dense_observation[0].dz), dense_stride)
-                                if dense_mirror_count != 0 && dense_mirror_residue == selected_dense_residue {
-                                    apply_masks(&live_mirror[dense_constraint_row * band_x_count + dense_mirror_begin], dense_mirror_count, &grid, x0 + bitcast[i64](dense_mirror_begin) - sext[i64](dense_observation[0].dx), dense_constraint_z - sext[i64](dense_observation[0].dz), dense_stride, dense_observation, true)
+                            }
+                            dense_mirror_bucket i64 = dense_constraint_mod - selected_dense_residue
+                            if dense_mirror_bucket < 0 { dense_mirror_bucket += dense_stride }
+                            if dense_mirror_count != 0 {
+                                dense_mirror_bucket_index usize = bitcast[usize](dense_mirror_bucket)
+                                for dense_mirror_position usize = dense_bucket_offsets[dense_mirror_bucket_index]; dense_mirror_position < dense_bucket_offsets[dense_mirror_bucket_index + 1]; dense_mirror_position += 1 {
+                                    dense_mirror_observation ptr[const Observation] = &observations[dense_observation_indices[dense_mirror_position]]
+                                    apply_masks(&live_mirror[dense_constraint_row * band_x_count + dense_mirror_begin], dense_mirror_count, &grid, x0 + bitcast[i64](dense_mirror_begin) - sext[i64](dense_mirror_observation[0].dx), dense_constraint_z - sext[i64](dense_mirror_observation[0].dz), dense_stride, dense_mirror_observation, true)
                                 }
                             }
+                            dense_constraint_mod += 1
+                            if dense_constraint_mod == dense_stride { dense_constraint_mod = 0 }
                         }
                     } else {
                         for sparse_family usize = 0; sparse_family < 3; sparse_family += 1 {
@@ -655,8 +696,9 @@ extern "C" {
                                 sparse_source_residue i64 = sparse_side == 0 ? sparse_representative : sparse_negative_representative
                                 sparse_reflected bool = sparse_side != 0
                                 sparse_slot usize = sparse_family * 2 + sparse_side
-                                sparse_cache ptr[u64] = &cache_storage[sparse_slot * 6 * source_x_capacity]
-                                generate_grid(&grid, source_x_min, source_x_max, band_source_z_min, band_source_z_max, sparse_source_residue, 32, sparse_reflected, p_direct, p_reflected, source_x_min, stats, sparse_cache, source_x_capacity, &sparse_cache_z[sparse_slot], &sparse_cache_count[sparse_slot], 1)
+                                sparse_cache ptr[u64] = &cache_storage[sparse_slot * sparse_cache_capacity * 6 * source_x_capacity]
+                                sparse_cached_z ptr[i64] = &sparse_cache_z[sparse_slot * sparse_cache_capacity]
+                                generate_grid(&grid, source_x_min, source_x_max, band_source_z_min, band_source_z_max, sparse_source_residue, 32, sparse_reflected, p_direct, p_reflected, source_x_min, stats, sparse_cache, source_x_capacity, sparse_cached_z, &sparse_cache_count[sparse_slot], sparse_cache_capacity, reused_indices, reused_valid)
                                 for sparse_constraint_row usize = 0; sparse_constraint_row < band_rows; sparse_constraint_row += 1 {
                                     sparse_constraint_z i64 = band_z0 + bitcast[i64](sparse_constraint_row)
                                     sparse_direct_begin usize = 0
