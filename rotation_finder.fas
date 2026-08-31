@@ -212,22 +212,28 @@ fn flush_grid_batch(grid ptr[Grid], seeds vec[8,u64], coordinates_z vec[8,usize]
     }
 }
 
-fn generate_grid(grid ptr[Grid], x_min i64, x_max i64, z_min i64, z_max i64, z_residue i64, reflected bool, p_direct ptr[u64], p_reflected ptr[u64], p_x_min i64, stats ptr[ScanStats], cache ptr[u64], cache_stride usize, cached_z ptr[i64], cache_valid ptr[bool]) void {
+fn generate_grid(grid ptr[Grid], x_min i64, x_max i64, z_min i64, z_max i64, z_residue i64, z_stride i64, reflected bool, p_direct ptr[u64], p_reflected ptr[u64], p_x_min i64, stats ptr[ScanStats], cache ptr[u64], cache_stride usize, cached_z ptr[i64], cache_count ptr[usize], cache_capacity usize) void {
     grid[0].x_first = x_min
-    grid[0].z_first = first_congruent(z_min, z_residue, 32)
+    grid[0].z_first = first_congruent(z_min, z_residue, z_stride)
     grid[0].x_count = bitcast[usize](x_max - x_min)
     if grid[0].z_first >= z_max {
         grid[0].z_count = 0
     } else {
-        grid[0].z_count = bitcast[usize]((z_max - 1 - grid[0].z_first) / 32 + 1)
+        grid[0].z_count = bitcast[usize]((z_max - 1 - grid[0].z_first) / z_stride + 1)
     }
-    reuse bool = false
-    reused_row usize = 0
-    if cache_valid[0] && cached_z[0] >= grid[0].z_first && cached_z[0] < z_max {
-        distance i64 = cached_z[0] - grid[0].z_first
-        if distance % 32 == 0 {
-            reuse = true
-            reused_row = bitcast[usize](distance / 32)
+    reused_rows arr[2,usize]
+    reused_valid arr[2,bool]
+    reused_rows[0] = 0
+    reused_rows[1] = 0
+    reused_valid[0] = false
+    reused_valid[1] = false
+    for cache_index usize = 0; cache_index < cache_capacity; cache_index += 1 {
+        if cache_index < cache_count[0] && cached_z[cache_index] >= grid[0].z_first && cached_z[cache_index] < z_max {
+            distance i64 = cached_z[cache_index] - grid[0].z_first
+            if distance % z_stride == 0 {
+                reused_valid[cache_index] = true
+                reused_rows[cache_index] = bitcast[usize](distance / z_stride)
+            }
         }
     }
     for desired_base_low u64 = 0; desired_base_low < 64; desired_base_low += 1 {
@@ -236,8 +242,8 @@ fn generate_grid(grid ptr[Grid], x_min i64, x_max i64, z_min i64, z_max i64, z_r
         coordinates_x vec[8,usize] = splat(0)
         lanes usize = 0
         for zi usize = 0; zi < grid[0].z_count; zi += 1 {
-            if !reuse || zi != reused_row {
-                rz i64 = grid[0].z_first + bitcast[i64](zi * 32)
+            if (!reused_valid[0] || zi != reused_rows[0]) && (!reused_valid[1] || zi != reused_rows[1]) {
+                rz i64 = grid[0].z_first + bitcast[i64](zi) * z_stride
                 physical_z i32 = trunc[i32](reflected ? -rz : rz)
                 q u64 = q_bits(physical_z)
                 physical_x_residue u64 = (47 * (desired_base_low ^ (q & 63))) & 63
@@ -265,18 +271,22 @@ fn generate_grid(grid ptr[Grid], x_min i64, x_max i64, z_min i64, z_max i64, z_r
         if lanes != 0 { flush_grid_batch(grid, seeds, coordinates_z, coordinates_x, lanes, desired_base_low) }
     }
     for zi usize = 0; zi < grid[0].z_count; zi += 1 {
-        rz i64 = grid[0].z_first + bitcast[i64](zi * 32)
+        rz i64 = grid[0].z_first + bitcast[i64](zi) * z_stride
         physical_z i32 = trunc[i32](reflected ? -rz : rz)
         q u64 = q_bits(physical_z)
         row usize = zi * grid[0].x_count
-        if reuse && zi == reused_row {
+        reused_index usize = 2
+        if reused_valid[0] && zi == reused_rows[0] { reused_index = 0 }
+        if reused_valid[1] && zi == reused_rows[1] { reused_index = 1 }
+        if reused_index < 2 {
+            cache_base usize = reused_index * 6 * cache_stride
             for xi usize = 0; xi < grid[0].x_count; xi += 1 {
-                grid[0].zero[row + xi] = cache[xi]
-                grid[0].one[row + xi] = cache[cache_stride + xi]
-                grid[0].three[row + xi] = cache[2 * cache_stride + xi]
-                grid[0].mirror_zero[row + xi] = cache[3 * cache_stride + xi]
-                grid[0].mirror_one[row + xi] = cache[4 * cache_stride + xi]
-                grid[0].mirror_three[row + xi] = cache[5 * cache_stride + xi]
+                grid[0].zero[row + xi] = cache[cache_base + xi]
+                grid[0].one[row + xi] = cache[cache_base + cache_stride + xi]
+                grid[0].three[row + xi] = cache[cache_base + 2 * cache_stride + xi]
+                grid[0].mirror_zero[row + xi] = cache[cache_base + 3 * cache_stride + xi]
+                grid[0].mirror_one[row + xi] = cache[cache_base + 4 * cache_stride + xi]
+                grid[0].mirror_three[row + xi] = cache[cache_base + 5 * cache_stride + xi]
             }
         } else {
             for xi usize = 0; xi < grid[0].x_count; xi += 1 {
@@ -289,22 +299,23 @@ fn generate_grid(grid ptr[Grid], x_min i64, x_max i64, z_min i64, z_max i64, z_r
             }
         }
     }
-    if grid[0].z_count == 0 {
-        cache_valid[0] = false
-    } else {
-        last_row usize = grid[0].z_count - 1
-        cached_z[0] = grid[0].z_first + bitcast[i64](last_row * 32)
-        cache_valid[0] = cached_z[0] >= z_min + 64
-        row usize = last_row * grid[0].x_count
-        if cache_valid[0] {
+    cache_count[0] = 0
+    for cache_row usize = 0; cache_row < grid[0].z_count; cache_row += 1 {
+        row_z i64 = grid[0].z_first + bitcast[i64](cache_row) * z_stride
+        if row_z >= z_min + 64 && cache_count[0] < cache_capacity {
+            store_index usize = cache_count[0]
+            cache_base usize = store_index * 6 * cache_stride
+            cached_z[store_index] = row_z
+            row usize = cache_row * grid[0].x_count
             for xi usize = 0; xi < grid[0].x_count; xi += 1 {
-                cache[xi] = grid[0].zero[row + xi]
-                cache[cache_stride + xi] = grid[0].one[row + xi]
-                cache[2 * cache_stride + xi] = grid[0].three[row + xi]
-                cache[3 * cache_stride + xi] = grid[0].mirror_zero[row + xi]
-                cache[4 * cache_stride + xi] = grid[0].mirror_one[row + xi]
-                cache[5 * cache_stride + xi] = grid[0].mirror_three[row + xi]
+                cache[cache_base + xi] = grid[0].zero[row + xi]
+                cache[cache_base + cache_stride + xi] = grid[0].one[row + xi]
+                cache[cache_base + 2 * cache_stride + xi] = grid[0].three[row + xi]
+                cache[cache_base + 3 * cache_stride + xi] = grid[0].mirror_zero[row + xi]
+                cache[cache_base + 4 * cache_stride + xi] = grid[0].mirror_one[row + xi]
+                cache[cache_base + 5 * cache_stride + xi] = grid[0].mirror_three[row + xi]
             }
+            cache_count[0] += 1
         }
     }
 }
@@ -332,13 +343,19 @@ fn grid_release(grid ptr[Grid]) void {
     release[u64](grid[0].bits_one)
 }
 
-fn covered_residue(residue i64) bool {
+fn dense_residue(dense_stride i64) i64 {
+    return dense_stride % 2 == 0 ? dense_stride / 2 : 0
+}
+
+fn covered_source_z(source_z i64, dense_stride i64) bool {
+    if dense_stride != 0 { return floor_mod(source_z, dense_stride) == dense_residue(dense_stride) }
+    residue i64 = floor_mod(source_z, 32)
     return residue == 2 || residue == 30 || residue == 8 || residue == 24 || residue == 13 || residue == 19
 }
 
-fn apply_masks(live ptr[u64], count usize, grid ptr[Grid], source_x0 i64, source_z i64, observation ptr[const Observation], mirror_mask bool) void {
+fn apply_masks(live ptr[u64], count usize, grid ptr[Grid], source_x0 i64, source_z i64, z_stride i64, observation ptr[const Observation], mirror_mask bool) void {
     source_x usize = bitcast[usize](source_x0 - grid[0].x_first)
-    source_row usize = bitcast[usize]((source_z - grid[0].z_first) / 32)
+    source_row usize = bitcast[usize]((source_z - grid[0].z_first) / z_stride)
     source usize = source_row * grid[0].x_count + source_x
     side_base usize = mirror_mask ? 3 : 0
     shift u64 = zext[u64](observation[0].dy)
@@ -359,13 +376,13 @@ fn apply_masks(live ptr[u64], count usize, grid ptr[Grid], source_x0 i64, source
     }
 }
 
-fn verify_candidates(observations ptr[const Observation], observation_count usize, candidate_x ptr[vec[8,i32]], candidate_y ptr[vec[8,i32]], initial_count usize, candidate_z i32, context ptr[u8], stats ptr[ScanStats]) bool {
+fn verify_candidates(observations ptr[const Observation], observation_count usize, candidate_x ptr[vec[8,i32]], candidate_y ptr[vec[8,i32]], initial_count usize, candidate_z i32, dense_stride i64, context ptr[u8], stats ptr[ScanStats]) bool {
     count usize = initial_count
     stats[0].prefix_survivors += zext[u64](count)
     for observation_index usize = 0; observation_index < observation_count; observation_index += 1 {
         observation ptr[const Observation] = &observations[observation_index]
         physical_z i32 = bitcast[i32](bitcast[u32](candidate_z) + bitcast[u32](observation[0].dz))
-        if !covered_residue(floor_mod(sext[i64](physical_z), 32)) {
+        if !covered_source_z(sext[i64](physical_z), dense_stride) {
             if count == 0 { break }
             stats[0].verifier_evaluations += zext[u64](count)
             q u64 = q_bits(physical_z)
@@ -404,7 +421,7 @@ fn verify_candidates(observations ptr[const Observation], observation_count usiz
     return true
 }
 
-fn process_row(live ptr[u64], begin usize, count usize, x0 i64, canonical_z i64, mirror bool, observations ptr[const Observation], observation_count usize, candidate_x ptr[vec[8,i32]], candidate_y ptr[vec[8,i32]], context ptr[u8], stats ptr[ScanStats]) bool {
+fn process_row(live ptr[u64], begin usize, count usize, x0 i64, canonical_z i64, mirror bool, observations ptr[const Observation], observation_count usize, candidate_x ptr[vec[8,i32]], candidate_y ptr[vec[8,i32]], dense_stride i64, context ptr[u8], stats ptr[ScanStats]) bool {
     candidate_count usize = 0
     for local usize = 0; local < count; local += 1 {
         bits u64 = live[begin + local]
@@ -421,7 +438,7 @@ fn process_row(live ptr[u64], begin usize, count usize, x0 i64, canonical_z i64,
         }
     }
     physical_z i32 = trunc[i32](mirror ? -canonical_z : canonical_z)
-    return verify_candidates(observations, observation_count, candidate_x, candidate_y, candidate_count, physical_z, context, stats)
+    return verify_candidates(observations, observation_count, candidate_x, candidate_y, candidate_count, physical_z, dense_stride, context, stats)
 }
 
 fn direct_span(range ptr[const SearchRange], x0 i64, x1 i64, z i64, begin ptr[usize], count ptr[usize]) void {
@@ -508,8 +525,31 @@ extern "C" {
             x_halo = maximum[i64](x_halo, absolute(sext[i64](observations[halo_index].dx)))
             z_halo = maximum[i64](z_halo, absolute(sext[i64](observations[halo_index].dz)))
         }
+        residue_counts ptr[usize] = allocate[usize](observation_count + 1)
+        if residue_counts == null { return 1 }
+        defer { release[usize](residue_counts) }
+        dense_stride i64 = 0
+        candidate_stride usize = observation_count / 5
+        while candidate_stride >= 2 && dense_stride == 0 {
+            for candidate_slot usize = 0; candidate_slot < candidate_stride; candidate_slot += 1 {
+                residue_counts[candidate_slot] = 0
+            }
+            for candidate_observation usize = 0; candidate_observation < observation_count; candidate_observation += 1 {
+                candidate_residue usize = bitcast[usize](floor_mod(sext[i64](observations[candidate_observation].dz), bitcast[i64](candidate_stride)))
+                residue_counts[candidate_residue] += 1
+            }
+            candidate_fits bool = true
+            for candidate_check_slot usize = 0; candidate_check_slot < candidate_stride; candidate_check_slot += 1 {
+                if residue_counts[candidate_check_slot] < 5 { candidate_fits = false }
+            }
+            if candidate_fits {
+                dense_stride = bitcast[i64](candidate_stride)
+            } else {
+                candidate_stride -= 1
+            }
+        }
         source_x_capacity usize = bitcast[usize](tile_size + 2 * x_halo)
-        source_z_capacity usize = bitcast[usize]((64 + 2 * z_halo + 31) / 32 + 1)
+        source_z_capacity usize = dense_stride != 0 ? bitcast[usize]((64 + 2 * z_halo + dense_stride - 1) / dense_stride + 1) : bitcast[usize]((64 + 2 * z_halo + 31) / 32 + 1)
         grid_capacity usize = source_x_capacity * source_z_capacity
         live_capacity usize = bitcast[usize](tile_size * 64)
         candidate_capacity usize = bitcast[usize]((tile_size * 62 + 7) / 8)
@@ -549,11 +589,15 @@ extern "C" {
                     p_direct[source_index] = p_bits(source_coordinate)
                     p_reflected[source_index] = p_bits(-source_coordinate)
                 }
-                cache_z arr[6,i64]
-                cache_valid arr[6,bool]
+                dense_cache_z arr[2,i64]
+                dense_cache_z[0] = 0
+                dense_cache_z[1] = 0
+                dense_cache_count usize = 0
+                sparse_cache_z arr[6,i64]
+                sparse_cache_count arr[6,usize]
                 for cache_index usize = 0; cache_index < 6; cache_index += 1 {
-                    cache_z[cache_index] = 0
-                    cache_valid[cache_index] = false
+                    sparse_cache_z[cache_index] = 0
+                    sparse_cache_count[cache_index] = 0
                 }
                 for band_z0 i64 = z0; band_z0 < z1; band_z0 += 64 {
                     band_z1 i64 = minimum[i64](z1, band_z0 + 64)
@@ -578,41 +622,68 @@ extern "C" {
                             live_mirror[initialization_row * band_x_count + initialization_mirror_begin + mirror_initialization_index] = initial_live
                         }
                     }
-                    for family usize = 0; family < 3; family += 1 {
-                        representative i64 = family_residue(family)
-                        negative_representative i64 = floor_mod(-representative, 32)
-                        for side usize = 0; side < 2; side += 1 {
-                            source_residue i64 = side == 0 ? representative : negative_representative
-                            reflected bool = side != 0
-                            cached_slot usize = family * 2 + side
-                            cache ptr[u64] = &cache_storage[cached_slot * 6 * source_x_capacity]
-                            generate_grid(&grid, source_x_min, source_x_max, band_source_z_min, band_source_z_max, source_residue, reflected, p_direct, p_reflected, source_x_min, stats, cache, source_x_capacity, &cache_z[cached_slot], &cache_valid[cached_slot])
-                            for constraint_row usize = 0; constraint_row < band_rows; constraint_row += 1 {
-                                constraint_z i64 = band_z0 + bitcast[i64](constraint_row)
-                                constraint_direct_begin usize = 0
-                                constraint_direct_count usize = 0
-                                if constraint_z >= sext[i64](range[0].z_min) && constraint_z < sext[i64](range[0].z_max) {
-                                    direct_span(range, x0, x1, constraint_z, &constraint_direct_begin, &constraint_direct_count)
+                    if dense_stride != 0 {
+                        selected_dense_residue i64 = dense_residue(dense_stride)
+                        generate_grid(&grid, source_x_min, source_x_max, band_source_z_min, band_source_z_max, selected_dense_residue, dense_stride, false, p_direct, p_reflected, source_x_min, stats, cache_storage, source_x_capacity, &dense_cache_z[0], &dense_cache_count, 2)
+                        for dense_constraint_row usize = 0; dense_constraint_row < band_rows; dense_constraint_row += 1 {
+                            dense_constraint_z i64 = band_z0 + bitcast[i64](dense_constraint_row)
+                            dense_direct_begin usize = 0
+                            dense_direct_count usize = 0
+                            if dense_constraint_z >= sext[i64](range[0].z_min) && dense_constraint_z < sext[i64](range[0].z_max) {
+                                direct_span(range, x0, x1, dense_constraint_z, &dense_direct_begin, &dense_direct_count)
+                            }
+                            dense_mirror_begin usize = 0
+                            dense_mirror_count usize = 0
+                            mirror_span(range, x0, x1, dense_constraint_z, &dense_mirror_begin, &dense_mirror_count)
+                            for dense_observation_index usize = 0; dense_observation_index < observation_count; dense_observation_index += 1 {
+                                dense_observation ptr[const Observation] = &observations[dense_observation_index]
+                                dense_direct_residue i64 = floor_mod(dense_constraint_z + sext[i64](dense_observation[0].dz), dense_stride)
+                                if dense_direct_count != 0 && dense_direct_residue == selected_dense_residue {
+                                    apply_masks(&live_direct[dense_constraint_row * band_x_count + dense_direct_begin], dense_direct_count, &grid, x0 + bitcast[i64](dense_direct_begin) + sext[i64](dense_observation[0].dx), dense_constraint_z + sext[i64](dense_observation[0].dz), dense_stride, dense_observation, false)
                                 }
-                                constraint_mirror_begin usize = 0
-                                constraint_mirror_count usize = 0
-                                mirror_span(range, x0, x1, constraint_z, &constraint_mirror_begin, &constraint_mirror_count)
-                                for observation_index usize = 0; observation_index < observation_count; observation_index += 1 {
-                                    observation ptr[const Observation] = &observations[observation_index]
-                                    direct_source_residue i64 = floor_mod(constraint_z + sext[i64](observation[0].dz), 32)
-                                    if constraint_direct_count != 0 {
-                                        if side == 0 && direct_source_residue == representative {
-                                            apply_masks(&live_direct[constraint_row * band_x_count + constraint_direct_begin], constraint_direct_count, &grid, x0 + bitcast[i64](constraint_direct_begin) + sext[i64](observation[0].dx), constraint_z + sext[i64](observation[0].dz), observation, false)
-                                        } else if side == 1 && direct_source_residue == negative_representative {
-                                            apply_masks(&live_direct[constraint_row * band_x_count + constraint_direct_begin], constraint_direct_count, &grid, x0 + bitcast[i64](constraint_direct_begin) + sext[i64](observation[0].dx), constraint_z + sext[i64](observation[0].dz), observation, true)
-                                        }
+                                dense_mirror_residue i64 = floor_mod(dense_constraint_z - sext[i64](dense_observation[0].dz), dense_stride)
+                                if dense_mirror_count != 0 && dense_mirror_residue == selected_dense_residue {
+                                    apply_masks(&live_mirror[dense_constraint_row * band_x_count + dense_mirror_begin], dense_mirror_count, &grid, x0 + bitcast[i64](dense_mirror_begin) - sext[i64](dense_observation[0].dx), dense_constraint_z - sext[i64](dense_observation[0].dz), dense_stride, dense_observation, true)
+                                }
+                            }
+                        }
+                    } else {
+                        for sparse_family usize = 0; sparse_family < 3; sparse_family += 1 {
+                            sparse_representative i64 = family_residue(sparse_family)
+                            sparse_negative_representative i64 = floor_mod(-sparse_representative, 32)
+                            for sparse_side usize = 0; sparse_side < 2; sparse_side += 1 {
+                                sparse_source_residue i64 = sparse_side == 0 ? sparse_representative : sparse_negative_representative
+                                sparse_reflected bool = sparse_side != 0
+                                sparse_slot usize = sparse_family * 2 + sparse_side
+                                sparse_cache ptr[u64] = &cache_storage[sparse_slot * 6 * source_x_capacity]
+                                generate_grid(&grid, source_x_min, source_x_max, band_source_z_min, band_source_z_max, sparse_source_residue, 32, sparse_reflected, p_direct, p_reflected, source_x_min, stats, sparse_cache, source_x_capacity, &sparse_cache_z[sparse_slot], &sparse_cache_count[sparse_slot], 1)
+                                for sparse_constraint_row usize = 0; sparse_constraint_row < band_rows; sparse_constraint_row += 1 {
+                                    sparse_constraint_z i64 = band_z0 + bitcast[i64](sparse_constraint_row)
+                                    sparse_direct_begin usize = 0
+                                    sparse_direct_count usize = 0
+                                    if sparse_constraint_z >= sext[i64](range[0].z_min) && sparse_constraint_z < sext[i64](range[0].z_max) {
+                                        direct_span(range, x0, x1, sparse_constraint_z, &sparse_direct_begin, &sparse_direct_count)
                                     }
-                                    mirror_source_residue i64 = floor_mod(constraint_z - sext[i64](observation[0].dz), 32)
-                                    if constraint_mirror_count != 0 {
-                                        if side == 0 && mirror_source_residue == representative {
-                                            apply_masks(&live_mirror[constraint_row * band_x_count + constraint_mirror_begin], constraint_mirror_count, &grid, x0 + bitcast[i64](constraint_mirror_begin) - sext[i64](observation[0].dx), constraint_z - sext[i64](observation[0].dz), observation, true)
-                                        } else if side == 1 && mirror_source_residue == negative_representative {
-                                            apply_masks(&live_mirror[constraint_row * band_x_count + constraint_mirror_begin], constraint_mirror_count, &grid, x0 + bitcast[i64](constraint_mirror_begin) - sext[i64](observation[0].dx), constraint_z - sext[i64](observation[0].dz), observation, false)
+                                    sparse_mirror_begin usize = 0
+                                    sparse_mirror_count usize = 0
+                                    mirror_span(range, x0, x1, sparse_constraint_z, &sparse_mirror_begin, &sparse_mirror_count)
+                                    for sparse_observation_index usize = 0; sparse_observation_index < observation_count; sparse_observation_index += 1 {
+                                        sparse_observation ptr[const Observation] = &observations[sparse_observation_index]
+                                        sparse_direct_residue i64 = floor_mod(sparse_constraint_z + sext[i64](sparse_observation[0].dz), 32)
+                                        if sparse_direct_count != 0 {
+                                            if sparse_side == 0 && sparse_direct_residue == sparse_representative {
+                                                apply_masks(&live_direct[sparse_constraint_row * band_x_count + sparse_direct_begin], sparse_direct_count, &grid, x0 + bitcast[i64](sparse_direct_begin) + sext[i64](sparse_observation[0].dx), sparse_constraint_z + sext[i64](sparse_observation[0].dz), 32, sparse_observation, false)
+                                            } else if sparse_side == 1 && sparse_direct_residue == sparse_negative_representative {
+                                                apply_masks(&live_direct[sparse_constraint_row * band_x_count + sparse_direct_begin], sparse_direct_count, &grid, x0 + bitcast[i64](sparse_direct_begin) + sext[i64](sparse_observation[0].dx), sparse_constraint_z + sext[i64](sparse_observation[0].dz), 32, sparse_observation, true)
+                                            }
+                                        }
+                                        sparse_mirror_residue i64 = floor_mod(sparse_constraint_z - sext[i64](sparse_observation[0].dz), 32)
+                                        if sparse_mirror_count != 0 {
+                                            if sparse_side == 0 && sparse_mirror_residue == sparse_representative {
+                                                apply_masks(&live_mirror[sparse_constraint_row * band_x_count + sparse_mirror_begin], sparse_mirror_count, &grid, x0 + bitcast[i64](sparse_mirror_begin) - sext[i64](sparse_observation[0].dx), sparse_constraint_z - sext[i64](sparse_observation[0].dz), 32, sparse_observation, true)
+                                            } else if sparse_side == 1 && sparse_mirror_residue == sparse_negative_representative {
+                                                apply_masks(&live_mirror[sparse_constraint_row * band_x_count + sparse_mirror_begin], sparse_mirror_count, &grid, x0 + bitcast[i64](sparse_mirror_begin) - sext[i64](sparse_observation[0].dx), sparse_constraint_z - sext[i64](sparse_observation[0].dz), 32, sparse_observation, false)
+                                            }
                                         }
                                     }
                                 }
@@ -627,13 +698,13 @@ extern "C" {
                             direct_span(range, x0, x1, extraction_z, &extraction_direct_begin, &extraction_direct_count)
                         }
                         if extraction_direct_count != 0 {
-                            if !process_row(&live_direct[extraction_row * band_x_count], extraction_direct_begin, extraction_direct_count, x0, extraction_z, false, observations, observation_count, candidate_x, candidate_y, context, stats) { return 2 }
+                            if !process_row(&live_direct[extraction_row * band_x_count], extraction_direct_begin, extraction_direct_count, x0, extraction_z, false, observations, observation_count, candidate_x, candidate_y, dense_stride, context, stats) { return 2 }
                         }
                         extraction_mirror_begin usize = 0
                         extraction_mirror_count usize = 0
                         mirror_span(range, x0, x1, extraction_z, &extraction_mirror_begin, &extraction_mirror_count)
                         if extraction_mirror_count != 0 {
-                            if !process_row(&live_mirror[extraction_row * band_x_count], extraction_mirror_begin, extraction_mirror_count, x0, extraction_z, true, observations, observation_count, candidate_x, candidate_y, context, stats) { return 2 }
+                            if !process_row(&live_mirror[extraction_row * band_x_count], extraction_mirror_begin, extraction_mirror_count, x0, extraction_z, true, observations, observation_count, candidate_x, candidate_y, dense_stride, context, stats) { return 2 }
                         }
                     }
                 }
