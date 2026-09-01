@@ -192,10 +192,9 @@ fn store_masks(grid ptr[Grid], index usize, x i32, z i32, base u64, q u64, plane
     }
 }
 
-fn flush_grid_batch(grid ptr[Grid], seeds ptr[u64], coordinates_z ptr[usize], coordinates_x ptr[usize], lanes usize, desired_base_low u64) void {
-    seed_vector vec[8,u64] = bitcast[ptr[vec[8,u64]]](seeds)[0]
-    values vec[8,u64] = seed_vector * (seed_vector * splat(42317861) + splat(11))
-    differences vec[8,u64] = splat(42317861) * (seed_vector * splat(2) + splat(1)) + splat(11)
+fn flush_grid_batch(grid ptr[Grid], seeds vec[8,u64], indices vec[8,usize], lanes usize, desired_base_low u64) void {
+    values vec[8,u64] = seeds * (seeds * splat(42317861) + splat(11))
+    differences vec[8,u64] = splat(42317861) * (seeds * splat(2) + splat(1)) + splat(11)
     plane_zero vec[8,u64] = splat(0)
     plane_one vec[8,u64] = splat(0)
     for low u64 = 0; low < 64; low += 1 {
@@ -207,7 +206,7 @@ fn flush_grid_batch(grid ptr[Grid], seeds ptr[u64], coordinates_z ptr[usize], co
         differences += splat(84635722)
     }
     for lane usize = 0; lane < lanes; lane += 1 {
-        index usize = coordinates_z[lane] * grid[0].x_count + coordinates_x[lane]
+        index usize = indices[lane]
         grid[0].bits_zero[index] = plane_zero[lane]
         grid[0].bits_one[index] = plane_one[lane]
     }
@@ -237,9 +236,8 @@ fn generate_grid(grid ptr[Grid], x_min i64, x_max i64, z_min i64, z_max i64, z_r
         }
     }
     for desired_base_low u64 = 0; desired_base_low < 64; desired_base_low += 1 {
-        seeds arr[8,u64]
-        coordinates_z arr[8,usize]
-        coordinates_x arr[8,usize]
+        seeds vec[8,u64] = splat(0)
+        indices vec[8,usize] = splat(0)
         lanes usize = 0
         for zi usize = 0; zi < grid[0].z_count; zi += 1 {
             if !reused_valid[zi] {
@@ -252,15 +250,14 @@ fn generate_grid(grid ptr[Grid], x_min i64, x_max i64, z_min i64, z_max i64, z_r
                 xi usize = bitcast[usize](floor_mod(canonical_x_residue - floor_mod(grid[0].x_first, 64), 64))
                 while xi < grid[0].x_count {
                     if lanes == 8 {
-                        flush_grid_batch(grid, &seeds[0], &coordinates_z[0], &coordinates_x[0], lanes, desired_base_low)
+                        flush_grid_batch(grid, seeds, indices, lanes, desired_base_low)
                         lanes = 0
                     }
                     rx i64 = grid[0].x_first + bitcast[i64](xi)
                     p_index usize = bitcast[usize](rx - p_x_min)
                     p u64 = reflected ? p_reflected[p_index] : p_direct[p_index]
                     base u64 = p ^ q
-                    coordinates_z[lanes] = zi
-                    coordinates_x[lanes] = xi
+                    indices[lanes] = zi * grid[0].x_count + xi
                     seeds[lanes] = (base ^ 18446744073709551615) & 18446744073709551552
                     lanes += 1
                     xi += 64
@@ -271,7 +268,7 @@ fn generate_grid(grid ptr[Grid], x_min i64, x_max i64, z_min i64, z_max i64, z_r
             for padding_lane usize = lanes; padding_lane < 8; padding_lane += 1 {
                 seeds[padding_lane] = 0
             }
-            flush_grid_batch(grid, &seeds[0], &coordinates_z[0], &coordinates_x[0], lanes, desired_base_low)
+            flush_grid_batch(grid, seeds, indices, lanes, desired_base_low)
         }
     }
     for zi usize = 0; zi < grid[0].z_count; zi += 1 {
