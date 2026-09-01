@@ -471,7 +471,8 @@ int main(int argc, char **argv) {
             matches.count = next_count;
         }
     }
-    qsort(matches.data, matches.count, sizeof(*matches.data), compare_matches);
+    if (matches.count > 1)
+        qsort(matches.data, matches.count, sizeof(*matches.data), compare_matches);
     if (options.print_matches) {
         for (size_t index = 0; index < matches.count; ++index) {
             printf("%" PRId32 " %" PRId32 " %" PRId32 "\n",
