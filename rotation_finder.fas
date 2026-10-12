@@ -1,837 +1,441 @@
-struct Observation {
-    dx i32
-    dy i32
-    dz i32
-    rotation u8
+use "C" <errno.h>
+use "C" <limits.h>
+use "C" <pthread.h>
+use "C" <stdint.h>
+use "C" <stdio.h>
+use "C" <stdlib.h>
+use "C" <string.h>
+use "C" <time.h>
+use "scan.fas"
+
+struct Options {
+    pattern_path addr
+    range SearchRange
+    tile_size i64
+    threads i32
+    print_matches bool
 }
 
-struct SearchRange {
-    x_min i32
-    x_max i32
-    y_min i32
-    y_max i32
-    z_min i32
-    z_max i32
+struct ObservationList {
+    items addr
+    count usize
+    capacity usize
 }
 
-struct ScanStats {
-    paid_source_columns u64
-    generated_source_blocks u64
-    prefix_survivors u64
-    verifier_evaluations u64
-    matches u64
+struct LineBuffer {
+    text addr
+    capacity usize
 }
 
-struct Grid {
-    x_first i64
-    z_first i64
-    x_count usize
-    z_count usize
-    zero addr
-    one addr
-    three addr
-    mirror_zero addr
-    mirror_one addr
-    mirror_three addr
-    bits_zero addr
-    bits_one addr
+struct PatternFields {
+    dx i64
+    dy i64
+    dz i64
+    rotation i64
+    extra u8
 }
 
-extern "C" {
-    fn fas_allocate_memory(size usize, alignment usize) addr
-    fn fas_release_memory(value addr) void
-    fn fas_record_match(context addr, x i32, y i32, z i32) bool
+struct Parsed {
+    value i64
+    end addr
 }
 
-fn allocate[T](count usize) addr {
-    if count == 0 { return null }
-    return fas_allocate_memory(count * sizeof[T], alignof[T])
+struct Worker {
+    observations addr
+    observation_count usize
+    range addr
+    tile_size i64
+    work_begin i64
+    work_end i64
+    fast_path bool
+    stats ScanStats
+    matches MatchList
+    status i32
 }
 
-fn release[T](value addr) void {
-    if value != null { fas_release_memory(value) }
+fn usage(program addr, status i32) void {
+    stream handle[FILE] = if status == 0 { stdout } else { stderr }
+    fprintf(stream, c"Usage: %s PATTERN [options]\n\n", program)
+    fprintf(stream, c"Pattern lines are: dx dy dz rotation.\n")
+    fprintf(stream, c"Arbitrary dy is supported.\n")
+    fprintf(stream, c"Ranges are half-open and origin-Y height may contain at most 64 values.\n\n")
+    fprintf(stream, c"Options:\n")
+    fprintf(stream, c"  --size N          centered N x N X/Z plane\n")
+    fprintf(stream, c"  --x-min N         default -5000\n")
+    fprintf(stream, c"  --x-max N         default  5000\n")
+    fprintf(stream, c"  --z-min N         default -5000\n")
+    fprintf(stream, c"  --z-max N         default  5000\n")
+    fprintf(stream, c"  --y-min N         default -60\n")
+    fprintf(stream, c"  --y-max N         default 1\n")
+    fprintf(stream, c"  --tile-size N     cache tile edge, default 1024, max 1024\n")
+    fprintf(stream, c"  --threads N       pthread workers, default 1\n")
+    fprintf(stream, c"  --quiet           do not print individual matches\n")
+    fprintf(stream, c"  --help            show this help\n")
+    exit(status)
 }
 
-fn minimum[T](left T, right T) T {
-    return left < right ? left : right
-}
-
-fn maximum[T](left T, right T) T {
-    return left > right ? left : right
-}
-
-fn absolute(value i64) i64 {
-    return value < 0 ? -value : value
-}
-
-fn floor_mod(value i64, modulus i64) i64 {
-    remainder i64 = value % modulus
-    return remainder < 0 ? remainder + modulus : remainder
-}
-
-fn first_congruent(minimum_value i64, residue i64, modulus i64) i64 {
-    return minimum_value + floor_mod(residue - floor_mod(minimum_value, modulus), modulus)
-}
-
-fn p_bits(x i32) u64 {
-    product u32 = bitcast[u32](x) * 3129871
-    signed_product i32 = bitcast[i32](product)
-    return bitcast[u64](sext[i64](signed_product))
-}
-
-fn q_bits(z i32) u64 {
-    return bitcast[u64](sext[i64](z)) * 116129781
-}
-
-fn mixed_value(seed u64) u64 {
-    return seed * (seed * 42317861 + 11)
-}
-
-fn rotation_from_mixed(mixed u64) u8 {
-    state u64 = ((mixed >> 16) ^ 0x5deece66d) & 0xffffffffffff
-    state = (state * 0x5deece66d + 11) & 0xffffffffffff
-    return trunc[u8]((state >> 46))
-}
-
-fn rotation_vector(mixed vec[8,u64]) vec[8,u64] {
-    state vec[8,u64] = ((mixed >> 16) ^ splat(0x5deece66d)) & splat(0xffffffffffff)
-    state = (state * splat(0x5deece66d) + splat(11)) & splat(0xffffffffffff)
-    return (state >> 46)
-}
-
-fn vanilla3_rotation(x i32, y i32, z i32) u8 {
-    seed u64 = p_bits(x) ^ q_bits(z) ^ bitcast[u64](sext[i64](y))
-    return rotation_from_mixed(mixed_value(seed))
-}
-
-fn xor_index_permute(input u64, delta u8) u64 {
-    value u64 = input
-    for bit u8 = 0; bit < 6; bit += 1 {
-        if ((delta >> bit) & 1) != 0 {
-            shift u64 = (zext[u64](1) << zext[u64](bit))
-            low_mask u64 = 18446744073709551615 / ((zext[u64](1) << shift) + 1)
-            value = ((value & low_mask) << shift) | ((value & ~low_mask) >> shift)
-        }
-    }
-    return value
-}
-
-fn selected_bits(plane_zero u64, plane_one u64, rotation u8) u64 {
-    if rotation == 0 { return ~(plane_zero | plane_one) }
-    if rotation == 1 { return plane_zero & ~plane_one }
-    if rotation == 2 { return ~plane_zero & plane_one }
-    return plane_zero & plane_one
-}
-
-fn portable_mask(plane_zero u64, plane_one u64, y0 u8, y1 u8, rotation u8) u64 {
-    result u64 = (selected_bits(plane_zero, plane_one, rotation) >> 4)
-    if y0 == rotation { result |= (zext[u64](1) << 60) }
-    if y1 == rotation { result |= (zext[u64](1) << 61) }
-    return result
-}
-
-fn direct_column_masks(x i32, z i32, zero addr, one addr, three addr) void {
-    base u64 = p_bits(x) ^ q_bits(z)
-    first_seed u64 = (base ^ 18446744073709551615) & 18446744073709551552
-    value u64 = mixed_value(first_seed)
-    difference u64 = 42317861 * (first_seed * 2 + 1) + 11
-    base_low u64 = base & 63
-    plane_zero u64 = 0
-    plane_one u64 = 0
-    for low u64 = 0; low < 64; low += 1 {
-        y_index u64 = low ^ base_low
-        rotation u8 = rotation_from_mixed(value)
-        plane_zero |= (zext[u64](rotation & 1) << y_index)
-        plane_one |= (zext[u64]((rotation >> 1) & 1) << y_index)
-        value += difference
-        difference += 84635722
-    }
-    y0 u8 = vanilla3_rotation(x, 0, z)
-    y1 u8 = vanilla3_rotation(x, 1, z)
-    zero[u64] = portable_mask(plane_zero, plane_one, y0, y1, 0)
-    one[u64] = portable_mask(plane_zero, plane_one, y0, y1, 1)
-    three[u64] = portable_mask(plane_zero, plane_one, y0, y1, 3)
-}
-
-fn grid_plane(grid addr, index usize) addr {
-    if index == 0 { return grid[Grid].zero }
-    if index == 1 { return grid[Grid].one }
-    if index == 2 { return grid[Grid].three }
-    if index == 3 { return grid[Grid].mirror_zero }
-    if index == 4 { return grid[Grid].mirror_one }
-    return grid[Grid].mirror_three
-}
-
-fn store_masks(grid addr, index usize, x i32, z i32, base u64, q u64, plane_zero u64, plane_one u64, stats addr) void {
-    y0 u8 = rotation_from_mixed(mixed_value(base))
-    y1 u8 = rotation_from_mixed(mixed_value(base ^ 1))
-    grid[Grid].zero[u64, index] = portable_mask(plane_zero, plane_one, y0, y1, 0)
-    grid[Grid].one[u64, index] = portable_mask(plane_zero, plane_one, y0, y1, 1)
-    grid[Grid].three[u64, index] = portable_mask(plane_zero, plane_one, y0, y1, 3)
-    stats[ScanStats].paid_source_columns += 1
-    stats[ScanStats].generated_source_blocks += 1
-    p u64 = base ^ q
-    delta_wide u64 = (p ^ (0 - p)) ^ (q ^ (0 - q))
-    if delta_wide < 64 {
-        delta u8 = trunc[u8](delta_wide)
-        mirror_plane_zero u64 = xor_index_permute(plane_zero, delta)
-        mirror_plane_one u64 = xor_index_permute(plane_one, delta)
-        mirror_y0 u8 = y0
-        mirror_y1 u8 = y1
-        if delta != 0 {
-            mirror_y0 = rotation_from_mixed(mixed_value(base ^ zext[u64](delta)))
-            mirror_y1 = rotation_from_mixed(mixed_value(base ^ zext[u64](delta ^ 1)))
-        }
-        grid[Grid].mirror_zero[u64, index] = portable_mask(mirror_plane_zero, mirror_plane_one, mirror_y0, mirror_y1, 0)
-        grid[Grid].mirror_one[u64, index] = portable_mask(mirror_plane_zero, mirror_plane_one, mirror_y0, mirror_y1, 1)
-        grid[Grid].mirror_three[u64, index] = portable_mask(mirror_plane_zero, mirror_plane_one, mirror_y0, mirror_y1, 3)
-    } else {
-        direct_column_masks(-x, -z, &grid[Grid].mirror_zero[u64, index], &grid[Grid].mirror_one[u64, index], &grid[Grid].mirror_three[u64, index])
-        stats[ScanStats].paid_source_columns += 1
-        stats[ScanStats].generated_source_blocks += 1
-    }
-}
-
-fn flush_grid_batch(grid addr, seeds vec[8,u64], indices vec[8,usize], lanes usize, desired_base_low u64) void {
-    values vec[8,u64] = seeds * (seeds * splat(42317861) + splat(11))
-    differences vec[8,u64] = splat(42317861) * (seeds * splat(2) + splat(1)) + splat(11)
-    plane_zero vec[8,u64] = splat(0)
-    plane_one vec[8,u64] = splat(0)
-    for low u64 = 0; low < 64; low += 1 {
-        bit u64 = (zext[u64](1) << (low ^ desired_base_low))
-        rotations vec[8,u64] = rotation_vector(values)
-        plane_zero |= (splat(0) - (rotations & splat(1))) & splat(bit)
-        plane_one |= (splat(0) - ((rotations >> 1) & splat(1))) & splat(bit)
-        values += differences
-        differences += splat(84635722)
-    }
-    for lane usize = 0; lane < lanes; lane += 1 {
-        index usize = indices[lane]
-        grid[Grid].bits_zero[u64, index] = plane_zero[lane]
-        grid[Grid].bits_one[u64, index] = plane_one[lane]
-    }
-}
-
-fn generate_grid(grid addr, x_min i64, x_max i64, z_min i64, z_max i64, z_residue i64, z_stride i64, reflected bool, p_direct addr, p_reflected addr, p_x_min i64, stats addr, cache addr, cache_stride usize, cached_z addr, cache_count addr, cache_capacity usize, reused_indices addr, reused_valid addr) void {
-    grid[Grid].x_first = x_min
-    grid[Grid].z_first = first_congruent(z_min, z_residue, z_stride)
-    grid[Grid].x_count = bitcast[usize](x_max - x_min)
-    if grid[Grid].z_first >= z_max {
-        grid[Grid].z_count = 0
-    } else {
-        grid[Grid].z_count = bitcast[usize]((z_max - 1 - grid[Grid].z_first) / z_stride + 1)
-    }
-    for reused_row usize = 0; reused_row < grid[Grid].z_count; reused_row += 1 {
-        reused_indices[usize, reused_row] = 0
-        reused_valid[bool, reused_row] = false
-    }
-    for cache_index usize = 0; cache_index < cache_capacity; cache_index += 1 {
-        if cache_index < cache_count[usize] && cached_z[i64, cache_index] >= grid[Grid].z_first && cached_z[i64, cache_index] < z_max {
-            distance i64 = cached_z[i64, cache_index] - grid[Grid].z_first
-            if distance % z_stride == 0 {
-                calculated_reused_row usize = bitcast[usize](distance / z_stride)
-                reused_valid[bool, calculated_reused_row] = true
-                reused_indices[usize, calculated_reused_row] = cache_index
-            }
-        }
-    }
-    for desired_base_low u64 = 0; desired_base_low < 64; desired_base_low += 1 {
-        seeds vec[8,u64] = splat(0)
-        indices vec[8,usize] = splat(0)
-        lanes usize = 0
-        for zi usize = 0; zi < grid[Grid].z_count; zi += 1 {
-            if !reused_valid[bool, zi] {
-                rz i64 = grid[Grid].z_first + bitcast[i64](zi) * z_stride
-                physical_z i32 = trunc[i32](reflected ? -rz : rz)
-                q u64 = q_bits(physical_z)
-                physical_x_residue u64 = (47 * (desired_base_low ^ (q & 63))) & 63
-                canonical_x_residue i64 = bitcast[i64](physical_x_residue)
-                if reflected { canonical_x_residue = bitcast[i64]((64 - physical_x_residue) & 63) }
-                xi usize = bitcast[usize](floor_mod(canonical_x_residue - floor_mod(grid[Grid].x_first, 64), 64))
-                while xi < grid[Grid].x_count {
-                    if lanes == 8 {
-                        flush_grid_batch(grid, seeds, indices, lanes, desired_base_low)
-                        lanes = 0
-                    }
-                    rx i64 = grid[Grid].x_first + bitcast[i64](xi)
-                    p_index usize = bitcast[usize](rx - p_x_min)
-                    p u64 = reflected ? p_reflected[u64, p_index] : p_direct[u64, p_index]
-                    base u64 = p ^ q
-                    indices[lanes] = zi * grid[Grid].x_count + xi
-                    seeds[lanes] = (base ^ 18446744073709551615) & 18446744073709551552
-                    lanes += 1
-                    xi += 64
-                }
-            }
-        }
-        if lanes != 0 {
-            for padding_lane usize = lanes; padding_lane < 8; padding_lane += 1 {
-                seeds[padding_lane] = 0
-            }
-            flush_grid_batch(grid, seeds, indices, lanes, desired_base_low)
-        }
-    }
-    for zi usize = 0; zi < grid[Grid].z_count; zi += 1 {
-        rz i64 = grid[Grid].z_first + bitcast[i64](zi) * z_stride
-        physical_z i32 = trunc[i32](reflected ? -rz : rz)
-        q u64 = q_bits(physical_z)
-        row usize = zi * grid[Grid].x_count
-        reused_index usize = reused_valid[bool, zi] ? reused_indices[usize, zi] : cache_capacity
-        if reused_index < cache_capacity {
-            cache_base usize = reused_index * 6 * cache_stride
-            for xi usize = 0; xi < grid[Grid].x_count; xi += 1 {
-                grid[Grid].zero[u64, row + xi] = cache[u64, cache_base + xi]
-                grid[Grid].one[u64, row + xi] = cache[u64, cache_base + cache_stride + xi]
-                grid[Grid].three[u64, row + xi] = cache[u64, cache_base + 2 * cache_stride + xi]
-                grid[Grid].mirror_zero[u64, row + xi] = cache[u64, cache_base + 3 * cache_stride + xi]
-                grid[Grid].mirror_one[u64, row + xi] = cache[u64, cache_base + 4 * cache_stride + xi]
-                grid[Grid].mirror_three[u64, row + xi] = cache[u64, cache_base + 5 * cache_stride + xi]
-            }
-        } else {
-            for xi usize = 0; xi < grid[Grid].x_count; xi += 1 {
-                rx i64 = grid[Grid].x_first + bitcast[i64](xi)
-                physical_x i32 = trunc[i32](reflected ? -rx : rx)
-                p_index usize = bitcast[usize](rx - p_x_min)
-                p u64 = reflected ? p_reflected[u64, p_index] : p_direct[u64, p_index]
-                base u64 = p ^ q
-                store_masks(grid, row + xi, physical_x, physical_z, base, q, grid[Grid].bits_zero[u64, row + xi], grid[Grid].bits_one[u64, row + xi], stats)
-            }
-        }
-    }
-    cache_count[usize] = 0
-    for cache_row usize = 0; cache_row < grid[Grid].z_count; cache_row += 1 {
-        row_z i64 = grid[Grid].z_first + bitcast[i64](cache_row) * z_stride
-        if row_z >= z_min + 64 && cache_count[usize] < cache_capacity {
-            store_index usize = cache_count[usize]
-            cache_base usize = store_index * 6 * cache_stride
-            cached_z[i64, store_index] = row_z
-            row usize = cache_row * grid[Grid].x_count
-            for xi usize = 0; xi < grid[Grid].x_count; xi += 1 {
-                cache[u64, cache_base + xi] = grid[Grid].zero[u64, row + xi]
-                cache[u64, cache_base + cache_stride + xi] = grid[Grid].one[u64, row + xi]
-                cache[u64, cache_base + 2 * cache_stride + xi] = grid[Grid].three[u64, row + xi]
-                cache[u64, cache_base + 3 * cache_stride + xi] = grid[Grid].mirror_zero[u64, row + xi]
-                cache[u64, cache_base + 4 * cache_stride + xi] = grid[Grid].mirror_one[u64, row + xi]
-                cache[u64, cache_base + 5 * cache_stride + xi] = grid[Grid].mirror_three[u64, row + xi]
-            }
-            cache_count[usize] += 1
-        }
-    }
-}
-
-fn grid_allocate(grid addr, capacity usize) bool {
-    grid[Grid].zero = allocate[u64](capacity)
-    grid[Grid].one = allocate[u64](capacity)
-    grid[Grid].three = allocate[u64](capacity)
-    grid[Grid].mirror_zero = allocate[u64](capacity)
-    grid[Grid].mirror_one = allocate[u64](capacity)
-    grid[Grid].mirror_three = allocate[u64](capacity)
-    grid[Grid].bits_zero = allocate[u64](capacity)
-    grid[Grid].bits_one = allocate[u64](capacity)
-    return grid[Grid].zero != null && grid[Grid].one != null && grid[Grid].three != null && grid[Grid].mirror_zero != null && grid[Grid].mirror_one != null && grid[Grid].mirror_three != null && grid[Grid].bits_zero != null && grid[Grid].bits_one != null
-}
-
-fn grid_release(grid addr) void {
-    release[u64](grid[Grid].zero)
-    release[u64](grid[Grid].one)
-    release[u64](grid[Grid].three)
-    release[u64](grid[Grid].mirror_zero)
-    release[u64](grid[Grid].mirror_one)
-    release[u64](grid[Grid].mirror_three)
-    release[u64](grid[Grid].bits_zero)
-    release[u64](grid[Grid].bits_one)
-}
-
-fn dense_residue(dense_stride i64) i64 {
-    return dense_stride % 2 == 0 ? dense_stride / 2 : 0
-}
-
-fn covered_source_z(source_z i64, dense_stride i64) bool {
-    if dense_stride != 0 { return floor_mod(source_z, dense_stride) == dense_residue(dense_stride) }
-    residue i64 = floor_mod(source_z, 32)
-    return residue == 2 || residue == 30 || residue == 8 || residue == 24 || residue == 13 || residue == 19
-}
-
-fn apply_masks(live addr, count usize, grid addr, source_x0 i64, source_z i64, z_stride i64, observation addr, mirror_mask bool) void {
-    source_x usize = bitcast[usize](source_x0 - grid[Grid].x_first)
-    source_row usize = bitcast[usize]((source_z - grid[Grid].z_first) / z_stride)
-    source usize = source_row * grid[Grid].x_count + source_x
-    side_base usize = mirror_mask ? 3 : 0
-    shift u64 = zext[u64](observation[Observation].dy)
-    if observation[Observation].rotation != 2 {
-        stored usize = observation[Observation].rotation < 2 ? zext[usize](observation[Observation].rotation) : 2
-        masks addr = grid_plane(grid, side_base + stored)
-        if shift == 0 {
-            for zero_shift_index usize = 0; zero_shift_index < count; zero_shift_index += 1 {
-                live[u64, zero_shift_index] &= masks[u64, source + zero_shift_index]
-            }
-        } else {
-            for general_shift_index usize = 0; general_shift_index < count; general_shift_index += 1 {
-                live[u64, general_shift_index] &= (masks[u64, source + general_shift_index] >> shift)
-            }
-        }
-    } else {
-        zero addr = grid_plane(grid, side_base)
-        one addr = grid_plane(grid, side_base + 1)
-        three addr = grid_plane(grid, side_base + 2)
-        if shift == 0 {
-            for zero_shift_index usize = 0; zero_shift_index < count; zero_shift_index += 1 {
-                mask u64 = 0x3fffffffffffffff & ~(zero[u64, source + zero_shift_index] | one[u64, source + zero_shift_index] | three[u64, source + zero_shift_index])
-                live[u64, zero_shift_index] &= mask
-            }
-        } else {
-            for general_shift_index usize = 0; general_shift_index < count; general_shift_index += 1 {
-                mask u64 = 0x3fffffffffffffff & ~(zero[u64, source + general_shift_index] | one[u64, source + general_shift_index] | three[u64, source + general_shift_index])
-                live[u64, general_shift_index] &= (mask >> shift)
-            }
-        }
-    }
-}
-
-fn apply_mask_pair(live addr, count usize, grid addr, first_source_x0 i64, first_source_z i64, second_source_x0 i64, second_source_z i64, z_stride i64, first_observation addr, second_observation addr, mirror_mask bool) void {
-    first_source_x usize = bitcast[usize](first_source_x0 - grid[Grid].x_first)
-    first_source_row usize = bitcast[usize]((first_source_z - grid[Grid].z_first) / z_stride)
-    first_source usize = first_source_row * grid[Grid].x_count + first_source_x
-    second_source_x usize = bitcast[usize](second_source_x0 - grid[Grid].x_first)
-    second_source_row usize = bitcast[usize]((second_source_z - grid[Grid].z_first) / z_stride)
-    second_source usize = second_source_row * grid[Grid].x_count + second_source_x
-    side_base usize = mirror_mask ? 3 : 0
-    first_stored usize = first_observation[Observation].rotation < 2 ? zext[usize](first_observation[Observation].rotation) : 2
-    second_stored usize = second_observation[Observation].rotation < 2 ? zext[usize](second_observation[Observation].rotation) : 2
-    first_masks addr = grid_plane(grid, side_base + first_stored)
-    second_masks addr = grid_plane(grid, side_base + second_stored)
-    shift u64 = zext[u64](first_observation[Observation].dy)
-    if shift == 0 {
-        for zero_shift_index usize = 0; zero_shift_index < count; zero_shift_index += 1 {
-            live[u64, zero_shift_index] &= first_masks[u64, first_source + zero_shift_index] & second_masks[u64, second_source + zero_shift_index]
-        }
-    } else if shift == 1 {
-        for one_shift_index usize = 0; one_shift_index < count; one_shift_index += 1 {
-            combined u64 = first_masks[u64, first_source + one_shift_index] & second_masks[u64, second_source + one_shift_index]
-            live[u64, one_shift_index] &= (combined >> 1)
-        }
-    } else {
-        for general_shift_index usize = 0; general_shift_index < count; general_shift_index += 1 {
-            combined u64 = first_masks[u64, first_source + general_shift_index] & second_masks[u64, second_source + general_shift_index]
-            live[u64, general_shift_index] &= (combined >> shift)
-        }
-    }
-}
-
-fn verify_candidates(observations addr, observation_count usize, candidate_x addr, candidate_y addr, initial_count usize, candidate_z i32, dense_stride i64, context addr, stats addr) bool {
-    count usize = initial_count
-    stats[ScanStats].prefix_survivors += bitcast[u64](count)
-    for observation_index usize = 0; observation_index < observation_count; observation_index += 1 {
-        observation addr = &observations[Observation, observation_index]
-        physical_z i32 = bitcast[i32](bitcast[u32](candidate_z) + bitcast[u32](observation[Observation].dz))
-        if !covered_source_z(sext[i64](physical_z), dense_stride) {
-            if count == 0 { break }
-            stats[ScanStats].verifier_evaluations += bitcast[u64](count)
-            q u64 = q_bits(physical_z)
-            write usize = 0
-            for read usize = 0; read < count; read += 8 {
-                lanes usize = minimum[usize](8, count - read)
-                source_group usize = read / 8
-                xs vec[8,i32] = splat(0)
-                ys vec[8,i32] = splat(0)
-                seeds vec[8,u64] = splat(0)
-                for lane usize = 0; lane < lanes; lane += 1 {
-                    xs[lane] = candidate_x[i32, source_group * 8 + lane]
-                    ys[lane] = candidate_y[i32, source_group * 8 + lane]
-                    px i32 = bitcast[i32](bitcast[u32](xs[lane]) + bitcast[u32](observation[Observation].dx))
-                    py i32 = bitcast[i32](bitcast[u32](ys[lane]) + bitcast[u32](observation[Observation].dy))
-                    seeds[lane] = p_bits(px) ^ q ^ bitcast[u64](sext[i64](py))
-                }
-                rotations vec[8,u64] = rotation_vector(seeds * (seeds * splat(42317861) + splat(11)))
-                for verify_lane usize = 0; verify_lane < lanes; verify_lane += 1 {
-                    if rotations[verify_lane] == zext[u64](observation[Observation].rotation) {
-                        candidate_x[i32, write] = xs[verify_lane]
-                        candidate_y[i32, write] = ys[verify_lane]
-                        write += 1
-                    }
-                }
-            }
-            count = write
-        }
-    }
-    for index usize = 0; index < count; index += 1 {
-        if !fas_record_match(context, candidate_x[i32, index], candidate_y[i32, index], candidate_z) { return false }
-        stats[ScanStats].matches += 1
+fn parse_i64(text addr, parsed addr) bool {
+    view p = parsed[Parsed]
+    __errno_location()[i32] = 0
+    p.value = strtoll(text, &p.end, 10)
+    if __errno_location()[i32] != 0 || p.end == text || p.end[u8] != 0 {
+        return false
     }
     return true
 }
 
-fn process_row(live addr, begin usize, count usize, x0 i64, canonical_z i64, mirror bool, observations addr, observation_count usize, candidate_x addr, candidate_y addr, dense_stride i64, context addr, stats addr) bool {
-    candidate_count usize = 0
-    for local usize = 0; local < count; local += 1 {
-        bits u64 = live[u64, begin + local]
-        canonical_x i64 = x0 + bitcast[i64](begin + local)
-        physical_x i32 = trunc[i32](mirror ? -canonical_x : canonical_x)
-        while bits != 0 {
-            bit i32 = trunc[i32](ctz(bits))
-            candidate_x[i32, candidate_count] = physical_x
-            candidate_y[i32, candidate_count] = bit - 60
-            candidate_count += 1
-            bits &= bits - 1
-        }
+fn option_i32(option addr, text addr) i32 {
+    parsed Parsed = {}
+    if !parse_i64(text, &parsed) || parsed.value < INT32_MIN || parsed.value > INT32_MAX {
+        fprintf(stderr, c"error: invalid integer for %s: %s\n", option, text)
+        exit(1)
     }
-    physical_z i32 = trunc[i32](mirror ? -canonical_z : canonical_z)
-    return verify_candidates(observations, observation_count, candidate_x, candidate_y, candidate_count, physical_z, dense_stride, context, stats)
+    return trunc[i32](parsed.value)
 }
 
-fn direct_span(range addr, x0 i64, x1 i64, z i64, begin addr, count addr) void {
-    low i64 = maximum[i64](sext[i64](range[SearchRange].x_min), z == 0 ? 0 : x0)
-    low = maximum[i64](low, x0)
-    high i64 = minimum[i64](sext[i64](range[SearchRange].x_max), x1)
-    if low < high {
-        begin[usize] = bitcast[usize](low - x0)
-        count[usize] = bitcast[usize](high - low)
+fn option_i64(option addr, text addr) i64 {
+    parsed Parsed = {}
+    if !parse_i64(text, &parsed) {
+        fprintf(stderr, c"error: invalid integer for %s: %s\n", option, text)
+        exit(1)
+    }
+    return parsed.value
+}
+
+fn parse_options(argc i32, argv addr, options addr) void {
+    view o = options[Options]
+    if argc < 2 { usage(argv[addr, 0], 2) }
+    o.pattern_path = null
+    o.range.x_min = -5000
+    o.range.x_max = 5000
+    o.range.y_min = -60
+    o.range.y_max = 1
+    o.range.z_min = -5000
+    o.range.z_max = 5000
+    o.tile_size = 1024
+    o.threads = 1
+    o.print_matches = true
+    size_set bool = false
+    requested_size i64 = 0
+    argument_count usize = zext[usize](argc)
+    index usize = 1
+    while index < argument_count {
+        argument addr = argv[addr, index]
+        index += 1
+        if strcmp(argument, c"--help") == 0 { usage(argv[addr, 0], 0) }
+        if strcmp(argument, c"--quiet") == 0 {
+            o.print_matches = false
+            continue
+        }
+        if strncmp(argument, c"--", 2) != 0 {
+            if o.pattern_path != null {
+                fprintf(stderr, c"error: only one pattern file is allowed\n")
+                exit(1)
+            }
+            o.pattern_path = argument
+            continue
+        }
+        if index == argument_count {
+            fprintf(stderr, c"error: missing value after %s\n", argument)
+            exit(1)
+        }
+        value addr = argv[addr, index]
+        index += 1
+        if strcmp(argument, c"--size") == 0 {
+            requested_size = option_i64(argument, value)
+            if requested_size < 1 || requested_size > INT32_MAX {
+                fprintf(stderr, c"error: --size must be in [1, INT32_MAX]\n")
+                exit(1)
+            }
+            size_set = true
+        } else if strcmp(argument, c"--x-min") == 0 {
+            o.range.x_min = option_i32(argument, value)
+        } else if strcmp(argument, c"--x-max") == 0 {
+            o.range.x_max = option_i32(argument, value)
+        } else if strcmp(argument, c"--z-min") == 0 {
+            o.range.z_min = option_i32(argument, value)
+        } else if strcmp(argument, c"--z-max") == 0 {
+            o.range.z_max = option_i32(argument, value)
+        } else if strcmp(argument, c"--y-min") == 0 {
+            o.range.y_min = option_i32(argument, value)
+        } else if strcmp(argument, c"--y-max") == 0 {
+            o.range.y_max = option_i32(argument, value)
+        } else if strcmp(argument, c"--tile-size") == 0 {
+            o.tile_size = option_i64(argument, value)
+        } else if strcmp(argument, c"--threads") == 0 {
+            threads i64 = option_i64(argument, value)
+            if threads < 1 || threads > INT_MAX {
+                fprintf(stderr, c"error: --threads must be in [1, INT_MAX]\n")
+                exit(1)
+            }
+            o.threads = trunc[i32](threads)
+        } else {
+            fprintf(stderr, c"error: unknown option: %s\n", argument)
+            exit(1)
+        }
+    }
+    if o.pattern_path == null {
+        fprintf(stderr, c"error: a pattern file is required\n")
+        exit(1)
+    }
+    if size_set {
+        minimum i64 = -(requested_size / 2)
+        maximum i64 = minimum + requested_size
+        o.range.x_min = trunc[i32](minimum)
+        o.range.z_min = trunc[i32](minimum)
+        o.range.x_max = trunc[i32](maximum)
+        o.range.z_max = trunc[i32](maximum)
+    }
+}
+
+fn append_observation(list addr, dx i32, dy i32, dz i32, rotation u8) void {
+    view observations = list[ObservationList]
+    if observations.count == observations.capacity {
+        next usize = if observations.capacity == 0 { 32 } else { observations.capacity * 2 }
+        replacement addr = realloc(observations.items, next * sizeof[Observation])
+        if replacement == null {
+            fprintf(stderr, c"error: allocation failed\n")
+            exit(1)
+        }
+        observations.items = replacement
+        observations.capacity = next
+    }
+    entry addr = &observations.items[Observation, observations.count]
+    entry[Observation].dx = dx
+    entry[Observation].dy = dy
+    entry[Observation].dz = dz
+    entry[Observation].rotation = rotation
+    observations.count += 1
+}
+
+fn read_pattern(path addr, list addr) void {
+    file handle[FILE] = fopen(path, c"r")
+    if file == null {
+        fprintf(stderr, c"error: cannot open pattern file: %s\n", path)
+        exit(1)
+    }
+    line LineBuffer = {}
+    line_number usize = 0
+    fields PatternFields = {}
+    while getline(&line.text, &line.capacity, file) >= 0 {
+        line_number += 1
+        comment addr = strchr(line.text, '#')
+        if comment != null { comment[u8] = 0 }
+        field_count i32 = sscanf(line.text, c" %lld %lld %lld %lld %c", &fields.dx, &fields.dy, &fields.dz, &fields.rotation, &fields.extra)
+        if field_count == EOF { continue }
+        if field_count != 4 {
+            fprintf(stderr, c"error: %s:%zu: expected: dx dy dz rotation\n", path, line_number)
+            exit(1)
+        }
+        if fields.dx < INT32_MIN || fields.dx > INT32_MAX || fields.dy < INT32_MIN || fields.dy > INT32_MAX || fields.dz < INT32_MIN || fields.dz > INT32_MAX || fields.rotation < 0 || fields.rotation > 3 {
+            fprintf(stderr, c"error: %s:%zu: value is outside its supported range\n", path, line_number)
+            exit(1)
+        }
+        append_observation(list, trunc[i32](fields.dx), trunc[i32](fields.dy), trunc[i32](fields.dz), trunc[u8](fields.rotation))
+    }
+    free(line.text)
+    fclose(file)
+}
+
+fn validate(observations addr, observation_count usize, options addr) void {
+    view o = options[Options]
+    if observation_count == 0 || observation_count > 255 {
+        fprintf(stderr, c"error: pattern must contain between 1 and 255 observations\n")
+        exit(1)
+    }
+    if o.range.x_min >= o.range.x_max || o.range.y_min >= o.range.y_max || o.range.z_min >= o.range.z_max {
+        fprintf(stderr, c"error: all search ranges must be non-empty\n")
+        exit(1)
+    }
+    if sext[i64](o.range.y_max) - sext[i64](o.range.y_min) > 64 {
+        fprintf(stderr, c"error: origin-Y height may contain at most 64 values\n")
+        exit(1)
+    }
+    if o.range.x_min == INT32_MIN || o.range.z_min == INT32_MIN {
+        fprintf(stderr, c"error: X/Z ranges may not contain INT32_MIN\n")
+        exit(1)
+    }
+    if o.tile_size < 1 || o.tile_size > 1024 {
+        fprintf(stderr, c"error: tile size must be in [1,1024]\n")
+        exit(1)
+    }
+    index usize = 0
+    while index < observation_count {
+        observation addr = &observations[Observation, index]
+        dx i64 = sext[i64](observation[Observation].dx)
+        dy i64 = sext[i64](observation[Observation].dy)
+        dz i64 = sext[i64](observation[Observation].dz)
+        y_min i64 = sext[i64](o.range.y_min) + dy
+        y_max i64 = sext[i64](o.range.y_max) - 1 + dy
+        x_min i64 = sext[i64](o.range.x_min) + dx
+        x_max i64 = sext[i64](o.range.x_max) - 1 + dx
+        z_min i64 = sext[i64](o.range.z_min) + dz
+        z_max i64 = sext[i64](o.range.z_max) - 1 + dz
+        if y_min < INT32_MIN || y_max > INT32_MAX {
+            fprintf(stderr, c"error: Y range plus observation offsets exceeds int32\n")
+            exit(1)
+        }
+        if x_min < -sext[i64](INT32_MAX) || x_max > INT32_MAX || z_min < -sext[i64](INT32_MAX) || z_max > INT32_MAX {
+            fprintf(stderr, c"error: range plus observation offsets exceeds int32\n")
+            exit(1)
+        }
+        index += 1
+    }
+}
+
+fn run_worker(argument addr) addr {
+    view w = argument[Worker]
+    if w.fast_path {
+        w.status = scan_worker(w.observations, w.observation_count, w.range, w.tile_size, w.work_begin, w.work_end, &argument[Worker].matches, &argument[Worker].stats)
     } else {
-        begin[usize] = 0
-        count[usize] = 0
+        w.status = scan_general_worker(w.observations, w.observation_count, w.range, w.work_begin, w.work_end, &argument[Worker].matches, &argument[Worker].stats)
     }
+    return null
 }
 
-fn mirror_span(range addr, x0 i64, x1 i64, z i64, begin addr, count addr) void {
-    minimum_z i64 = -sext[i64](range[SearchRange].z_max) + 1
-    maximum_z i64 = -sext[i64](range[SearchRange].z_min)
-    if z < minimum_z || z > maximum_z {
-        begin[usize] = 0
-        count[usize] = 0
-        return
+fn compare_matches(left addr, right addr) i32 {
+    view a = left[Match]
+    view b = right[Match]
+    if a.z != b.z { return if a.z < b.z { -1 } else { 1 } }
+    if a.x != b.x { return if a.x < b.x { -1 } else { 1 } }
+    if a.y != b.y { return if a.y < b.y { -1 } else { 1 } }
+    return 0
+}
+
+fn main(argc i32, argv addr) i32 {
+    options Options = {}
+    parse_options(argc, argv, &options)
+    observations ObservationList = {}
+    defer { free(observations.items) }
+    read_pattern(options.pattern_path, &observations)
+    validate(observations.items, observations.count, &options)
+
+    fast_path bool = options.range.y_min >= -60 && options.range.y_max <= 1
+    for index usize = 0; index < observations.count; index += 1 {
+        observation addr = &observations.items[Observation, index]
+        if observation[Observation].dy != 0 && observation[Observation].dy != 1 {
+            fast_path = false
+        }
     }
-    low i64 = maximum[i64](-sext[i64](range[SearchRange].x_max) + 1, z == 0 ? 1 : x0)
-    low = maximum[i64](low, x0)
-    high i64 = minimum[i64](-sext[i64](range[SearchRange].x_min) + 1, x1)
-    if low < high {
-        begin[usize] = bitcast[usize](low - x0)
-        count[usize] = bitcast[usize](high - low)
+
+    positive_z i64 = sext[i64](options.range.z_max) - 1
+    negative_z i64 = -sext[i64](options.range.z_min)
+    canonical_z_max i64 = maximum[i64](0, maximum[i64](positive_z, negative_z))
+    canonical_z_count i64 = canonical_z_max + 1
+    band_count i64 = (canonical_z_count + 63) / 64
+    work_count i64 = if fast_path { band_count } else { sext[i64](options.range.x_max) - sext[i64](options.range.x_min) }
+    worker_count i64 = minimum[i64](sext[i64](options.threads), work_count)
+
+    workers addr = calloc(bitcast[usize](worker_count), sizeof[Worker])
+    threads addr = calloc(bitcast[usize](worker_count), sizeof[u64])
+    if workers == null || threads == null {
+        fprintf(stderr, c"error: allocation failed\n")
+        return 1
+    }
+    defer { free(threads) }
+    defer { free(workers) }
+
+    for index i64 = 0; index < worker_count; index += 1 {
+        worker addr = &workers[Worker, bitcast[usize](index)]
+        view w = worker[Worker]
+        w.observations = observations.items
+        w.observation_count = observations.count
+        w.range = &options.range
+        w.tile_size = options.tile_size
+        w.fast_path = fast_path
+        if fast_path {
+            band_begin i64 = band_count * index / worker_count
+            band_end i64 = band_count * (index + 1) / worker_count
+            w.work_begin = band_begin * 64
+            w.work_end = minimum[i64](band_end * 64, canonical_z_count)
+        } else {
+            w.work_begin = sext[i64](options.range.x_min) + work_count * index / worker_count
+            w.work_end = sext[i64](options.range.x_min) + work_count * (index + 1) / worker_count
+        }
+    }
+
+    started timespec = {}
+    finished timespec = {}
+    clock_gettime(CLOCK_MONOTONIC, &started)
+    if worker_count == 1 {
+        run_worker(&workers[Worker, 0])
     } else {
-        begin[usize] = 0
-        count[usize] = 0
+        created i64 = 0
+        while created < worker_count - 1 {
+            create_status i32 = pthread_create(&threads[u64, bitcast[usize](created)], null, &run_worker, &workers[Worker, bitcast[usize](created)])
+            if create_status != 0 {
+                fprintf(stderr, c"error: pthread_create: %s\n", strerror(create_status))
+                break
+            }
+            created += 1
+        }
+        if created == worker_count - 1 {
+            run_worker(&workers[Worker, bitcast[usize](worker_count - 1)])
+        }
+        for index i64 = 0; index < created; index += 1 {
+            pthread_join(threads[u64, bitcast[usize](index)], null)
+        }
+        if created != worker_count - 1 { return 1 }
     }
-}
+    clock_gettime(CLOCK_MONOTONIC, &finished)
 
-fn family_residue(family usize) i64 {
-    if family == 0 { return 2 }
-    if family == 1 { return 8 }
-    return 13
-}
-
-extern "C" {
-    fn fas_vanilla3_rotation(x i32, y i32, z i32) u8 {
-        return vanilla3_rotation(x, y, z)
+    stats ScanStats = {}
+    matches MatchList = {}
+    defer { free(matches.items) }
+    for index i64 = 0; index < worker_count; index += 1 {
+        worker addr = &workers[Worker, bitcast[usize](index)]
+        if worker[Worker].status != 0 {
+            fprintf(stderr, c"error: Fas worker failed with status %d\n", worker[Worker].status)
+            return 1
+        }
+        stats.paid_source_columns += worker[Worker].stats.paid_source_columns
+        stats.generated_source_blocks += worker[Worker].stats.generated_source_blocks
+        stats.prefix_survivors += worker[Worker].stats.prefix_survivors
+        stats.verifier_evaluations += worker[Worker].stats.verifier_evaluations
+        stats.matches += worker[Worker].stats.matches
+        if worker[Worker].matches.count != 0 {
+            next_count usize = matches.count + worker[Worker].matches.count
+            replacement addr = realloc(matches.items, next_count * sizeof[Match])
+            if replacement == null {
+                fprintf(stderr, c"error: allocation failed\n")
+                return 1
+            }
+            matches.items = replacement
+            memcpy(&matches.items[Match, matches.count], worker[Worker].matches.items, worker[Worker].matches.count * sizeof[Match])
+            matches.count = next_count
+        }
+    }
+    if matches.count > 1 {
+        qsort(matches.items, matches.count, sizeof[Match], &compare_matches)
+    }
+    if options.print_matches {
+        for index usize = 0; index < matches.count; index += 1 {
+            entry addr = &matches.items[Match, index]
+            printf(c"%d %d %d\n", entry[Match].x, entry[Match].y, entry[Match].z)
+        }
     }
 
-    fn fas_scan_general_worker(observations addr, observation_count usize, range addr, x_begin i64, x_end i64, context addr, stats addr) i32 {
-        for x i64 = x_begin; x < x_end; x += 1 {
-            for z i64 = sext[i64](range[SearchRange].z_min); z < sext[i64](range[SearchRange].z_max); z += 1 {
-                for y i32 = range[SearchRange].y_min; y < range[SearchRange].y_max; y += 1 {
-                    stats[ScanStats].prefix_survivors += 1
-                    matches bool = true
-                    for observation_index usize = 0; observation_index < observation_count; observation_index += 1 {
-                        observation addr = &observations[Observation, observation_index]
-                        stats[ScanStats].verifier_evaluations += 1
-                        physical_x i32 = bitcast[i32](bitcast[u32](trunc[i32](x)) + bitcast[u32](observation[Observation].dx))
-                        physical_y i32 = bitcast[i32](bitcast[u32](y) + bitcast[u32](observation[Observation].dy))
-                        physical_z i32 = bitcast[i32](bitcast[u32](trunc[i32](z)) + bitcast[u32](observation[Observation].dz))
-                        if vanilla3_rotation(physical_x, physical_y, physical_z) != observation[Observation].rotation {
-                            matches = false
-                            break
-                        }
-                    }
-                    if matches {
-                        if !fas_record_match(context, trunc[i32](x), y, trunc[i32](z)) { return 2 }
-                        stats[ScanStats].matches += 1
-                    }
-                }
-            }
-        }
-        return 0
+    width u64 = bitcast[u64](sext[i64](options.range.x_max) - sext[i64](options.range.x_min))
+    depth u64 = bitcast[u64](sext[i64](options.range.z_max) - sext[i64](options.range.z_min))
+    height u64 = bitcast[u64](sext[i64](options.range.y_max) - sext[i64](options.range.y_min))
+    if mul_hi(width, depth) != 0 || mul_hi(width * depth, height) != 0 {
+        fprintf(stderr, c"error: candidate count exceeds uint64\n")
+        return 1
     }
-
-    fn fas_scan_worker(observations addr, observation_count usize, range addr, tile_size i64, z_begin i64, z_end i64, context addr, stats addr) i32 {
-        initial_live u64 = 0
-        for y i32 = range[SearchRange].y_min; y < range[SearchRange].y_max; y += 1 {
-            initial_live |= (zext[u64](1) << zext[u64](y + 60))
-        }
-        x_union_min i64 = minimum[i64](sext[i64](range[SearchRange].x_min), -sext[i64](range[SearchRange].x_max - 1))
-        x_union_max i64 = maximum[i64](sext[i64](range[SearchRange].x_max - 1), -sext[i64](range[SearchRange].x_min))
-        x_halo i64 = 0
-        z_halo i64 = 0
-        for halo_index usize = 0; halo_index < observation_count; halo_index += 1 {
-            x_halo = maximum[i64](x_halo, absolute(sext[i64](observations[Observation, halo_index].dx)))
-            z_halo = maximum[i64](z_halo, absolute(sext[i64](observations[Observation, halo_index].dz)))
-        }
-        residue_counts addr = allocate[usize](observation_count + 1)
-        if residue_counts == null { return 1 }
-        defer { release[usize](residue_counts) }
-        dense_stride i64 = 0
-        candidate_stride usize = observation_count / 4
-        while candidate_stride >= 2 && dense_stride == 0 {
-            for candidate_slot usize = 0; candidate_slot < candidate_stride; candidate_slot += 1 {
-                residue_counts[usize, candidate_slot] = 0
-            }
-            for candidate_observation usize = 0; candidate_observation < observation_count; candidate_observation += 1 {
-                candidate_residue usize = bitcast[usize](floor_mod(sext[i64](observations[Observation, candidate_observation].dz), bitcast[i64](candidate_stride)))
-                residue_counts[usize, candidate_residue] += 1
-            }
-            candidate_fits bool = true
-            for candidate_check_slot usize = 0; candidate_check_slot < candidate_stride; candidate_check_slot += 1 {
-                if residue_counts[usize, candidate_check_slot] < 4 { candidate_fits = false }
-            }
-            if candidate_fits {
-                dense_stride = bitcast[i64](candidate_stride)
-            } else {
-                candidate_stride -= 1
-            }
-        }
-        dense_bucket_offsets addr = allocate[usize](observation_count + 1)
-        if dense_bucket_offsets == null { return 1 }
-        defer { release[usize](dense_bucket_offsets) }
-        dense_observation_indices addr = allocate[usize](observation_count)
-        if dense_observation_indices == null { return 1 }
-        defer { release[usize](dense_observation_indices) }
-        if dense_stride != 0 {
-            dense_bucket_offsets[usize] = 0
-            for dense_offset_slot usize = 0; dense_offset_slot < bitcast[usize](dense_stride); dense_offset_slot += 1 {
-                dense_bucket_offsets[usize, dense_offset_slot + 1] = dense_bucket_offsets[usize, dense_offset_slot] + residue_counts[usize, dense_offset_slot]
-                residue_counts[usize, dense_offset_slot] = dense_bucket_offsets[usize, dense_offset_slot]
-            }
-            for dense_sort_index usize = 0; dense_sort_index < observation_count; dense_sort_index += 1 {
-                dense_sort_residue usize = bitcast[usize](floor_mod(sext[i64](observations[Observation, dense_sort_index].dz), dense_stride))
-                dense_sort_position usize = residue_counts[usize, dense_sort_residue]
-                dense_observation_indices[usize, dense_sort_position] = dense_sort_index
-                residue_counts[usize, dense_sort_residue] += 1
-            }
-            for dense_group_slot usize = 0; dense_group_slot < bitcast[usize](dense_stride); dense_group_slot += 1 {
-                dense_group_begin usize = dense_bucket_offsets[usize, dense_group_slot]
-                dense_group_end usize = dense_bucket_offsets[usize, dense_group_slot + 1]
-                for dense_group_position usize = dense_group_begin + 1; dense_group_position < dense_group_end; dense_group_position += 1 {
-                    dense_group_index usize = dense_observation_indices[usize, dense_group_position]
-                    dense_group_observation addr = &observations[Observation, dense_group_index]
-                    dense_group_insert usize = dense_group_position
-                    while dense_group_insert > dense_group_begin {
-                        dense_group_previous_index usize = dense_observation_indices[usize, dense_group_insert - 1]
-                        dense_group_previous addr = &observations[Observation, dense_group_previous_index]
-                        dense_group_move bool = dense_group_previous[Observation].dy > dense_group_observation[Observation].dy || (dense_group_previous[Observation].dy == dense_group_observation[Observation].dy && dense_group_previous[Observation].rotation == 2 && dense_group_observation[Observation].rotation != 2)
-                        if !dense_group_move { break }
-                        dense_observation_indices[usize, dense_group_insert] = dense_group_previous_index
-                        dense_group_insert -= 1
-                    }
-                    dense_observation_indices[usize, dense_group_insert] = dense_group_index
-                }
-            }
-        }
-        source_x_capacity usize = bitcast[usize](tile_size + 2 * x_halo)
-        source_z_capacity usize = dense_stride != 0 ? bitcast[usize]((64 + 2 * z_halo + dense_stride - 1) / dense_stride + 1) : bitcast[usize]((64 + 2 * z_halo + 31) / 32 + 1)
-        dense_cache_capacity usize = dense_stride != 0 ? bitcast[usize]((2 * z_halo + dense_stride - 1) / dense_stride + 1) : 1
-        sparse_cache_capacity usize = bitcast[usize]((2 * z_halo + 31) / 32 + 1)
-        cache_rows usize = dense_stride != 0 ? dense_cache_capacity : 6 * sparse_cache_capacity
-        grid_capacity usize = source_x_capacity * source_z_capacity
-        live_capacity usize = bitcast[usize](tile_size * 64)
-        candidate_capacity usize = bitcast[usize]((tile_size * 62 + 7) / 8)
-        p_direct addr = allocate[u64](source_x_capacity)
-        if p_direct == null { return 1 }
-        defer { release[u64](p_direct) }
-        p_reflected addr = allocate[u64](source_x_capacity)
-        if p_reflected == null { return 1 }
-        defer { release[u64](p_reflected) }
-        cache_storage addr = allocate[u64](6 * cache_rows * source_x_capacity)
-        if cache_storage == null { return 1 }
-        defer { release[u64](cache_storage) }
-        dense_cache_z addr = allocate[i64](dense_cache_capacity)
-        if dense_cache_z == null { return 1 }
-        defer { release[i64](dense_cache_z) }
-        sparse_cache_z addr = allocate[i64](6 * sparse_cache_capacity)
-        if sparse_cache_z == null { return 1 }
-        defer { release[i64](sparse_cache_z) }
-        reused_indices addr = allocate[usize](source_z_capacity)
-        if reused_indices == null { return 1 }
-        defer { release[usize](reused_indices) }
-        reused_valid addr = allocate[bool](source_z_capacity)
-        if reused_valid == null { return 1 }
-        defer { release[bool](reused_valid) }
-        live_direct addr = allocate[u64](live_capacity)
-        if live_direct == null { return 1 }
-        defer { release[u64](live_direct) }
-        live_mirror addr = allocate[u64](live_capacity)
-        if live_mirror == null { return 1 }
-        defer { release[u64](live_mirror) }
-        candidate_x addr = allocate[i32](candidate_capacity * 8)
-        if candidate_x == null { return 1 }
-        defer { release[i32](candidate_x) }
-        candidate_y addr = allocate[i32](candidate_capacity * 8)
-        if candidate_y == null { return 1 }
-        defer { release[i32](candidate_y) }
-        grid Grid = (Grid){0, 0, 0, 0, null, null, null, null, null, null, null, null}
-        defer { grid_release(&grid) }
-        if !grid_allocate(&grid, grid_capacity) { return 1 }
-        for z0 i64 = z_begin; z0 < z_end; z0 += tile_size {
-            z1 i64 = minimum[i64](z_end, z0 + tile_size)
-            for x0 i64 = x_union_min; x0 <= x_union_max; x0 += tile_size {
-                x1 i64 = minimum[i64](x_union_max + 1, x0 + tile_size)
-                source_x_min i64 = x0 - x_halo
-                source_x_max i64 = x1 + x_halo
-                source_x_count usize = bitcast[usize](source_x_max - source_x_min)
-                for source_index usize = 0; source_index < source_x_count; source_index += 1 {
-                    source_coordinate i32 = trunc[i32](source_x_min + bitcast[i64](source_index))
-                    p_direct[u64, source_index] = p_bits(source_coordinate)
-                    p_reflected[u64, source_index] = p_bits(-source_coordinate)
-                }
-                dense_cache_count usize = 0
-                sparse_cache_count arr[6,usize]
-                for cache_index usize = 0; cache_index < 6; cache_index += 1 {
-                    sparse_cache_count[cache_index] = 0
-                }
-                for band_z0 i64 = z0; band_z0 < z1; band_z0 += 64 {
-                    band_z1 i64 = minimum[i64](z1, band_z0 + 64)
-                    band_source_z_min i64 = band_z0 - z_halo
-                    band_source_z_max i64 = band_z1 + z_halo
-                    band_rows usize = bitcast[usize](band_z1 - band_z0)
-                    band_x_count usize = bitcast[usize](x1 - x0)
-                    for initialization_row usize = 0; initialization_row < band_rows; initialization_row += 1 {
-                        initialization_z i64 = band_z0 + bitcast[i64](initialization_row)
-                        initialization_direct_begin usize = 0
-                        initialization_direct_count usize = 0
-                        if initialization_z >= sext[i64](range[SearchRange].z_min) && initialization_z < sext[i64](range[SearchRange].z_max) {
-                            direct_span(range, x0, x1, initialization_z, &initialization_direct_begin, &initialization_direct_count)
-                        }
-                        initialization_mirror_begin usize = 0
-                        initialization_mirror_count usize = 0
-                        mirror_span(range, x0, x1, initialization_z, &initialization_mirror_begin, &initialization_mirror_count)
-                        for direct_initialization_index usize = 0; direct_initialization_index < initialization_direct_count; direct_initialization_index += 1 {
-                            live_direct[u64, initialization_row * band_x_count + initialization_direct_begin + direct_initialization_index] = initial_live
-                        }
-                        for mirror_initialization_index usize = 0; mirror_initialization_index < initialization_mirror_count; mirror_initialization_index += 1 {
-                            live_mirror[u64, initialization_row * band_x_count + initialization_mirror_begin + mirror_initialization_index] = initial_live
-                        }
-                    }
-                    if dense_stride != 0 {
-                        selected_dense_residue i64 = dense_residue(dense_stride)
-                        generate_grid(&grid, source_x_min, source_x_max, band_source_z_min, band_source_z_max, selected_dense_residue, dense_stride, false, p_direct, p_reflected, source_x_min, stats, cache_storage, source_x_capacity, dense_cache_z, &dense_cache_count, dense_cache_capacity, reused_indices, reused_valid)
-                        dense_constraint_mod i64 = floor_mod(band_z0, dense_stride)
-                        for dense_constraint_row usize = 0; dense_constraint_row < band_rows; dense_constraint_row += 1 {
-                            dense_constraint_z i64 = band_z0 + bitcast[i64](dense_constraint_row)
-                            dense_direct_begin usize = 0
-                            dense_direct_count usize = 0
-                            if dense_constraint_z >= sext[i64](range[SearchRange].z_min) && dense_constraint_z < sext[i64](range[SearchRange].z_max) {
-                                direct_span(range, x0, x1, dense_constraint_z, &dense_direct_begin, &dense_direct_count)
-                            }
-                            dense_mirror_begin usize = 0
-                            dense_mirror_count usize = 0
-                            mirror_span(range, x0, x1, dense_constraint_z, &dense_mirror_begin, &dense_mirror_count)
-                            dense_direct_bucket i64 = selected_dense_residue - dense_constraint_mod
-                            if dense_direct_bucket < 0 { dense_direct_bucket += dense_stride }
-                            if dense_direct_count != 0 {
-                                dense_direct_bucket_index usize = bitcast[usize](dense_direct_bucket)
-                                dense_direct_position usize = dense_bucket_offsets[usize, dense_direct_bucket_index]
-                                while dense_direct_position < dense_bucket_offsets[usize, dense_direct_bucket_index + 1] {
-                                    dense_observation addr = &observations[Observation, dense_observation_indices[usize, dense_direct_position]]
-                                    if dense_direct_position + 1 < dense_bucket_offsets[usize, dense_direct_bucket_index + 1] {
-                                        next_dense_observation addr = &observations[Observation, dense_observation_indices[usize, dense_direct_position + 1]]
-                                        if dense_observation[Observation].rotation != 2 && next_dense_observation[Observation].rotation != 2 && dense_observation[Observation].dy == next_dense_observation[Observation].dy {
-                                            apply_mask_pair(&live_direct[u64, dense_constraint_row * band_x_count + dense_direct_begin], dense_direct_count, &grid, x0 + bitcast[i64](dense_direct_begin) + sext[i64](dense_observation[Observation].dx), dense_constraint_z + sext[i64](dense_observation[Observation].dz), x0 + bitcast[i64](dense_direct_begin) + sext[i64](next_dense_observation[Observation].dx), dense_constraint_z + sext[i64](next_dense_observation[Observation].dz), dense_stride, dense_observation, next_dense_observation, false)
-                                            dense_direct_position += 2
-                                        } else {
-                                            apply_masks(&live_direct[u64, dense_constraint_row * band_x_count + dense_direct_begin], dense_direct_count, &grid, x0 + bitcast[i64](dense_direct_begin) + sext[i64](dense_observation[Observation].dx), dense_constraint_z + sext[i64](dense_observation[Observation].dz), dense_stride, dense_observation, false)
-                                            dense_direct_position += 1
-                                        }
-                                    } else {
-                                        apply_masks(&live_direct[u64, dense_constraint_row * band_x_count + dense_direct_begin], dense_direct_count, &grid, x0 + bitcast[i64](dense_direct_begin) + sext[i64](dense_observation[Observation].dx), dense_constraint_z + sext[i64](dense_observation[Observation].dz), dense_stride, dense_observation, false)
-                                        dense_direct_position += 1
-                                    }
-                                }
-                            }
-                            dense_mirror_bucket i64 = dense_constraint_mod - selected_dense_residue
-                            if dense_mirror_bucket < 0 { dense_mirror_bucket += dense_stride }
-                            if dense_mirror_count != 0 {
-                                dense_mirror_bucket_index usize = bitcast[usize](dense_mirror_bucket)
-                                dense_mirror_position usize = dense_bucket_offsets[usize, dense_mirror_bucket_index]
-                                while dense_mirror_position < dense_bucket_offsets[usize, dense_mirror_bucket_index + 1] {
-                                    dense_mirror_observation addr = &observations[Observation, dense_observation_indices[usize, dense_mirror_position]]
-                                    if dense_mirror_position + 1 < dense_bucket_offsets[usize, dense_mirror_bucket_index + 1] {
-                                        next_dense_mirror_observation addr = &observations[Observation, dense_observation_indices[usize, dense_mirror_position + 1]]
-                                        if dense_mirror_observation[Observation].rotation != 2 && next_dense_mirror_observation[Observation].rotation != 2 && dense_mirror_observation[Observation].dy == next_dense_mirror_observation[Observation].dy {
-                                            apply_mask_pair(&live_mirror[u64, dense_constraint_row * band_x_count + dense_mirror_begin], dense_mirror_count, &grid, x0 + bitcast[i64](dense_mirror_begin) - sext[i64](dense_mirror_observation[Observation].dx), dense_constraint_z - sext[i64](dense_mirror_observation[Observation].dz), x0 + bitcast[i64](dense_mirror_begin) - sext[i64](next_dense_mirror_observation[Observation].dx), dense_constraint_z - sext[i64](next_dense_mirror_observation[Observation].dz), dense_stride, dense_mirror_observation, next_dense_mirror_observation, true)
-                                            dense_mirror_position += 2
-                                        } else {
-                                            apply_masks(&live_mirror[u64, dense_constraint_row * band_x_count + dense_mirror_begin], dense_mirror_count, &grid, x0 + bitcast[i64](dense_mirror_begin) - sext[i64](dense_mirror_observation[Observation].dx), dense_constraint_z - sext[i64](dense_mirror_observation[Observation].dz), dense_stride, dense_mirror_observation, true)
-                                            dense_mirror_position += 1
-                                        }
-                                    } else {
-                                        apply_masks(&live_mirror[u64, dense_constraint_row * band_x_count + dense_mirror_begin], dense_mirror_count, &grid, x0 + bitcast[i64](dense_mirror_begin) - sext[i64](dense_mirror_observation[Observation].dx), dense_constraint_z - sext[i64](dense_mirror_observation[Observation].dz), dense_stride, dense_mirror_observation, true)
-                                        dense_mirror_position += 1
-                                    }
-                                }
-                            }
-                            dense_constraint_mod += 1
-                            if dense_constraint_mod == dense_stride { dense_constraint_mod = 0 }
-                        }
-                    } else {
-                        for sparse_family usize = 0; sparse_family < 3; sparse_family += 1 {
-                            sparse_representative i64 = family_residue(sparse_family)
-                            sparse_negative_representative i64 = floor_mod(-sparse_representative, 32)
-                            for sparse_side usize = 0; sparse_side < 2; sparse_side += 1 {
-                                sparse_source_residue i64 = sparse_side == 0 ? sparse_representative : sparse_negative_representative
-                                sparse_reflected bool = sparse_side != 0
-                                sparse_slot usize = sparse_family * 2 + sparse_side
-                                sparse_cache addr = &cache_storage[u64, sparse_slot * sparse_cache_capacity * 6 * source_x_capacity]
-                                sparse_cached_z addr = &sparse_cache_z[i64, sparse_slot * sparse_cache_capacity]
-                                generate_grid(&grid, source_x_min, source_x_max, band_source_z_min, band_source_z_max, sparse_source_residue, 32, sparse_reflected, p_direct, p_reflected, source_x_min, stats, sparse_cache, source_x_capacity, sparse_cached_z, &sparse_cache_count[sparse_slot], sparse_cache_capacity, reused_indices, reused_valid)
-                                for sparse_constraint_row usize = 0; sparse_constraint_row < band_rows; sparse_constraint_row += 1 {
-                                    sparse_constraint_z i64 = band_z0 + bitcast[i64](sparse_constraint_row)
-                                    sparse_direct_begin usize = 0
-                                    sparse_direct_count usize = 0
-                                    if sparse_constraint_z >= sext[i64](range[SearchRange].z_min) && sparse_constraint_z < sext[i64](range[SearchRange].z_max) {
-                                        direct_span(range, x0, x1, sparse_constraint_z, &sparse_direct_begin, &sparse_direct_count)
-                                    }
-                                    sparse_mirror_begin usize = 0
-                                    sparse_mirror_count usize = 0
-                                    mirror_span(range, x0, x1, sparse_constraint_z, &sparse_mirror_begin, &sparse_mirror_count)
-                                    for sparse_observation_index usize = 0; sparse_observation_index < observation_count; sparse_observation_index += 1 {
-                                        sparse_observation addr = &observations[Observation, sparse_observation_index]
-                                        sparse_direct_residue i64 = floor_mod(sparse_constraint_z + sext[i64](sparse_observation[Observation].dz), 32)
-                                        if sparse_direct_count != 0 {
-                                            if sparse_side == 0 && sparse_direct_residue == sparse_representative {
-                                                apply_masks(&live_direct[u64, sparse_constraint_row * band_x_count + sparse_direct_begin], sparse_direct_count, &grid, x0 + bitcast[i64](sparse_direct_begin) + sext[i64](sparse_observation[Observation].dx), sparse_constraint_z + sext[i64](sparse_observation[Observation].dz), 32, sparse_observation, false)
-                                            } else if sparse_side == 1 && sparse_direct_residue == sparse_negative_representative {
-                                                apply_masks(&live_direct[u64, sparse_constraint_row * band_x_count + sparse_direct_begin], sparse_direct_count, &grid, x0 + bitcast[i64](sparse_direct_begin) + sext[i64](sparse_observation[Observation].dx), sparse_constraint_z + sext[i64](sparse_observation[Observation].dz), 32, sparse_observation, true)
-                                            }
-                                        }
-                                        sparse_mirror_residue i64 = floor_mod(sparse_constraint_z - sext[i64](sparse_observation[Observation].dz), 32)
-                                        if sparse_mirror_count != 0 {
-                                            if sparse_side == 0 && sparse_mirror_residue == sparse_representative {
-                                                apply_masks(&live_mirror[u64, sparse_constraint_row * band_x_count + sparse_mirror_begin], sparse_mirror_count, &grid, x0 + bitcast[i64](sparse_mirror_begin) - sext[i64](sparse_observation[Observation].dx), sparse_constraint_z - sext[i64](sparse_observation[Observation].dz), 32, sparse_observation, true)
-                                            } else if sparse_side == 1 && sparse_mirror_residue == sparse_negative_representative {
-                                                apply_masks(&live_mirror[u64, sparse_constraint_row * band_x_count + sparse_mirror_begin], sparse_mirror_count, &grid, x0 + bitcast[i64](sparse_mirror_begin) - sext[i64](sparse_observation[Observation].dx), sparse_constraint_z - sext[i64](sparse_observation[Observation].dz), 32, sparse_observation, false)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    for extraction_row usize = 0; extraction_row < band_rows; extraction_row += 1 {
-                        extraction_z i64 = band_z0 + bitcast[i64](extraction_row)
-                        extraction_direct_begin usize = 0
-                        extraction_direct_count usize = 0
-                        if extraction_z >= sext[i64](range[SearchRange].z_min) && extraction_z < sext[i64](range[SearchRange].z_max) {
-                            direct_span(range, x0, x1, extraction_z, &extraction_direct_begin, &extraction_direct_count)
-                        }
-                        if extraction_direct_count != 0 {
-                            if !process_row(&live_direct[u64, extraction_row * band_x_count], extraction_direct_begin, extraction_direct_count, x0, extraction_z, false, observations, observation_count, candidate_x, candidate_y, dense_stride, context, stats) { return 2 }
-                        }
-                        extraction_mirror_begin usize = 0
-                        extraction_mirror_count usize = 0
-                        mirror_span(range, x0, x1, extraction_z, &extraction_mirror_begin, &extraction_mirror_count)
-                        if extraction_mirror_count != 0 {
-                            if !process_row(&live_mirror[u64, extraction_row * band_x_count], extraction_mirror_begin, extraction_mirror_count, x0, extraction_z, true, observations, observation_count, candidate_x, candidate_y, dense_stride, context, stats) { return 2 }
-                        }
-                    }
-                }
-            }
-        }
-        return 0
-    }
+    candidate_columns u64 = width * depth
+    candidate_positions u64 = candidate_columns * height
+    elapsed f64 = cvt[f64](finished.tv_sec - started.tv_sec) + cvt[f64](finished.tv_nsec - started.tv_nsec) / 1000000000.0
+    rate f64 = if elapsed == 0.0 { 0.0 } else { cvt[f64](candidate_positions) / elapsed / 1000000.0 }
+    fprintf(stderr, c"threads=%d\n", trunc[i32](worker_count))
+    fprintf(stderr, c"threads_requested=%d\n", options.threads)
+    fprintf(stderr, c"elapsed_seconds=%.3f\n", elapsed)
+    fprintf(stderr, c"candidate_columns=%lu\n", candidate_columns)
+    fprintf(stderr, c"candidate_positions=%lu\n", candidate_positions)
+    fprintf(stderr, c"paid_source_columns=%lu\n", stats.paid_source_columns)
+    fprintf(stderr, c"generated_source_blocks=%lu\n", stats.generated_source_blocks)
+    fprintf(stderr, c"prefix_survivors=%lu\n", stats.prefix_survivors)
+    fprintf(stderr, c"verifier_evaluations=%lu\n", stats.verifier_evaluations)
+    fprintf(stderr, c"matches=%lu\n", stats.matches)
+    fprintf(stderr, c"million_positions_per_second=%.3f\n", rate)
+    return 0
 }
