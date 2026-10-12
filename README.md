@@ -19,6 +19,15 @@ z mod 32 = ±2, ±8, ±13
 
 Candidates that survive the mask pass are verified with the exact rotation function.
 
+## Build
+
+```sh
+fas rotation_finder.fas -o rotation_finder
+./rotation_finder pattern.txt --size 200 --quiet
+```
+
+`fas` uses `clang-22`, `opt-22` and `llc-22` by default. Set `FAS_CC`, `FAS_OPT` and `FAS_LLC` to use other tools. Run `./rotation_finder --help` for all options.
+
 ## Benchmark
 
 Search area:
